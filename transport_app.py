@@ -19,7 +19,7 @@ import requests
 LOGIN_ICON_PATH = r"Theresa.ico"
 LOGIN_BG_PATH = r"login_background.jpg"
 
-API_URL = os.getenv("API_URL", "http://localhost:5000")
+API_URL = os.getenv("API_URL", "http://34.179.169.197")
 
 POLL_INTERVAL_MS = 4000
 HTTP_TIMEOUT = 8
