@@ -18,9 +18,9 @@ import uvicorn
 
 # ================== TELEGRAM CONFIG ==================
 # Эти 3 поля обязательны. Их берёшь на https://my.telegram.org
-API_ID = int(os.getenv("TG_API_ID", "123456"))
-API_HASH = os.getenv("TG_API_HASH", "API_HASH")
-PHONE = os.getenv("TG_PHONE", "+998901234567")
+API_ID = int(os.getenv("TG_API_ID", "37930540"))
+API_HASH = os.getenv("TG_API_HASH", "d94a6e7d6ccc9f931e93db1f3097b079")
+PHONE = os.getenv("TG_PHONE", "+998777988735")
 SESSION = os.getenv("TG_SESSION", "tg_session")
 
 HOST = os.getenv("TG_HOST", "0.0.0.0")
@@ -883,5 +883,6 @@ async def startup():
 
 if __name__ == "__main__":
     uvicorn.run(app, host=HOST, port=PORT)
+
 
 
