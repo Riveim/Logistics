@@ -15,6 +15,10 @@ from typing import Optional, Dict, Any, Tuple
 
 from flask import Flask, request, jsonify, send_file, abort, send_from_directory
 
+# server.py
+# NOTE: FastAPI stub removed (kept Flask server below as the main API)
+
+
 # ================== CONFIG ==================
 # ===== EMAIL CONFIG =====
 SMTP_HOST = os.getenv("SMTP_HOST", "")
@@ -39,6 +43,10 @@ TOKEN_TTL_SECONDS = int(os.getenv("TOKEN_TTL_SECONDS", "86400"))
 SINGLE_SESSION_PER_USER = os.getenv("SINGLE_SESSION_PER_USER", "1") == "1"
 
 TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "0") == "1"
+
+TELEGRAM_FORWARD_ENABLED = os.getenv("TELEGRAM_FORWARD_ENABLED", "0") == "1"
+TELEGRAM_FORWARD_URL = os.getenv("TELEGRAM_FORWARD_URL", "http://127.0.0.1:5000")
+TELEGRAM_FORWARD_TOKEN = os.getenv("TELEGRAM_FORWARD_TOKEN", "CHANGE_ME_TG_TOKEN")
 
 ALLOWED_ROLES = {"manager", "transport", "admin"}
 ALLOWED_APPS = {"manager", "transport"}
@@ -426,6 +434,32 @@ if TELEGRAM_ENABLED:
     except Exception as e:
         telegram_engine = None
         print("[TELEGRAM] failed to init:", e)
+
+
+
+# ================== TELEGRAM BRIDGE HELPERS ==================
+def forward_order_to_telegram(order_payload: Dict[str, Any]) -> None:
+    # Forward a newly created order to external telegram_app if enabled.
+    if not TELEGRAM_FORWARD_ENABLED:
+        return
+    try:
+        requests.post(
+            f"{TELEGRAM_FORWARD_URL.rstrip('/')}/send_order",
+            json=order_payload,
+            headers={'X-Telegram-Token': TELEGRAM_FORWARD_TOKEN},
+            timeout=5,
+        )
+    except Exception as e:
+        print('[TG-FWD] send_order failed:', e)
+
+
+def upsert_market_offer(conn: sqlite3.Connection, order_id_i: int, transport_username: str, price_i: int, comment: str, contact: str, company: str) -> None:
+    cur = conn.cursor()
+    cur.execute(
+        'INSERT OR REPLACE INTO market_offers (order_id, transport_username, price, comment, contact, company, created_at) '
+        'VALUES (?, ?, ?, ?, ?, ?, ?)',
+        (order_id_i, transport_username, price_i, comment, contact, company, now_ts()),
+    )
 
 
 # ================== AUTH HELPERS ==================
@@ -816,20 +850,39 @@ def create_order():
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO orders (username, direction, cargo, tonnage, truck, date, price, info, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
-            (username, direction, cargo, float(tonnage), truck, date, float(price), info_text, now_ts()),
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)"
+            , (username, direction, cargo, float(tonnage), truck, date, float(price), info_text, now_ts())
         )
         order_id = cur.lastrowid
 
         # publish to market for transport users
         cur.execute("INSERT OR IGNORE INTO market_orders (order_id, status, created_at) VALUES (?, 'open', ?)", (order_id, now_ts()))
         conn.commit()
+
+        # Forward to telegram_app (broadcast to Telegram users)
+        try:
+            order_payload = {
+                "order_id": int(order_id),
+                "direction": direction,
+                "cargo": cargo,
+                "tonnage": float(tonnage),
+                "truck": truck,
+                "date": date,
+                "price": float(price),
+                "info": info_text,
+                "from_company": username,
+            }
+            forward_order_to_telegram(order_payload)
+        except Exception:
+            pass
+
         return jsonify({"status": "ok", "order_id": order_id}), 201
     finally:
         conn.close()
 
 
 @app.get("/orders/my")
+
 def list_my_orders():
     meta, err, code = require_auth()
     if err:
@@ -891,7 +944,7 @@ def market_orders():
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT o.* FROM orders o "
+            "SELECT o.*, o.username AS from_company FROM orders o "
             "JOIN market_orders m ON m.order_id = o.id "
             "WHERE m.status='open' "
             "ORDER BY o.id DESC LIMIT 300"
@@ -949,6 +1002,47 @@ def market_offer():
         return jsonify({"status": "ok"}), 201
     finally:
         conn.close()
+
+
+@app.post("/telegram/offer")
+def telegram_offer():
+    # Receive an offer coming from telegram_app (Telethon engine).
+    token = request.headers.get('X-Telegram-Token', '')
+    if not token or token != TELEGRAM_FORWARD_TOKEN:
+        return jsonify({'error': 'forbidden'}), 403
+
+    data = request.get_json(force=True)
+    order_id = data.get('order_id')
+    price = data.get('price')
+    comment = (data.get('comment') or '').strip()
+    tg_id = str(data.get('telegram_id') or '').strip()
+    tg_username = (data.get('telegram_username') or '').strip()
+    tg_name = (data.get('telegram_name') or '').strip()
+
+    try:
+        order_id_i = int(order_id)
+        price_i = int(float(price))
+    except Exception:
+        return jsonify({'error': 'bad order_id/price'}), 400
+
+    base_user = tg_username.lstrip('@') if tg_username else f'tg_{tg_id}'
+    transport_username = f'tg:{base_user}'
+    contact = f'@{base_user}' if tg_username else f'tg:{tg_id}'
+    company = tg_name or base_user or (f'Telegram {tg_id}' if tg_id else 'Telegram')
+
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM market_orders WHERE order_id=? AND status='open'", (order_id_i,))
+        if not cur.fetchone():
+            return jsonify({'error': 'order_not_open'}), 409
+
+        upsert_market_offer(conn, order_id_i, transport_username, price_i, comment, contact, company)
+        conn.commit()
+        return jsonify({'status': 'ok'}), 201
+    finally:
+        conn.close()
+
 
 
 @app.get("/market/offers/<int:order_id>")
