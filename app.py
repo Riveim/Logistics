@@ -14,6 +14,13 @@ import tkinter as tk
 from tkinter import ttk
 
 import requests
+# manager_app.py
+# Отправляет заявки на server.py
+# pip install requests
+
+import requests
+import os
+import json
 
 class AutoScrollbar(ttk.Scrollbar):
     """Scrollbar, который показывается только когда нужен (lo>0 или hi<1). Работает через grid()."""
@@ -755,8 +762,7 @@ class AppGUI:
                 "Направление": data["Направление"],
                 "Груз": data["Груз"],
                 "Тоннаж": data["Тоннаж"],
-                "Тип транспорта": data["Тип транспорта"],
-                "Дата": data["Дата"],
+                "Тип транспорта": data["Тип транспорта"]
             }
 
             missing = [name for name, value in required_fields.items() if not value]
