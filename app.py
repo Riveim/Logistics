@@ -1,4 +1,4 @@
-﻿# manager_app.py
+# manager_app.py
 # -*- coding: utf-8 -*-
 
 import os
@@ -38,7 +38,7 @@ class AutoScrollbar(ttk.Scrollbar):
 LOGIN_ICON_PATH = r"Theresa.ico"             # <-- сюда путь к .ico (Windows)
 LOGIN_BG_PATH = r"login_background.png"      # <-- сюда путь к .png/.gif (ВАЖНО: PhotoImage НЕ читает .jpg без PIL)
 
-API_URL = os.getenv("API_URL", "http://localhost:5000")
+API_URL = os.getenv("API_URL", "http://34.179.169.197")
 HTTP_TIMEOUT = 6
 
 # ================== THEME ==================
@@ -73,8 +73,6 @@ def safe_json(resp: requests.Response) -> Dict[str, Any]:
         return {}
 
 
-class LicenseKick(Exception):
-    pass
 
 
 
@@ -340,6 +338,23 @@ def error(parent: tk.Misc, title: str, text: str) -> None:
     dark_message(parent, title, text, "error")
 
 
+
+def exit_app(parent: tk.Misc, message: str = "Ключ продукта недействителен") -> None:
+    """Показывает окно ошибки и завершает программу."""
+    try:
+        error(parent, "Ошибка", message)
+    finally:
+        try:
+            parent.winfo_toplevel().destroy()
+        except Exception:
+            pass
+        try:
+            import os
+            os._exit(0)
+        except Exception:
+            raise SystemExit(0)
+
+
 class AppGUI:
     def __init__(self, root, token: str):
         self.root = root
@@ -354,23 +369,7 @@ class AppGUI:
 
         self.http = requests.Session()
         self.http.headers.update(self.headers)
-
-        # Wrap all HTTP requests: if server says the license is disabled/expired, force-exit the app.
-        _orig_request = self.http.request
-
-        def _wrapped_request(method, url, **kwargs):
-            resp = _orig_request(method, url, **kwargs)
-            try:
-                j = safe_json(resp)
-                if resp.status_code in (401, 403) and isinstance(j, dict) and j.get("error") in ("license_inactive", "license_expired"):
-                    raise LicenseKick(j.get("error"))
-            except LicenseKick:
-                raise
-            except Exception:
-                pass
-            return resp
-
-        self.http.request = _wrapped_request
+        # License is checked only on login/registration (server-authoritative).
 
         self.active_orders = set()
         self.offers_seen = {}
@@ -395,6 +394,14 @@ class AppGUI:
         self.build_center_panel()
         self.build_offers_panel()
 
+        # Горячие клавиши:
+        # ESC — отменить/сбросить ввод
+        # Enter в полях слева — добавить заявку
+        # Ctrl+Enter — добавить заявку (глобально)
+        self.root.bind("<Escape>", self.on_escape, add="+")
+        self.root.bind("<Control-Return>", lambda _e: self.add_order(), add="+")
+        self.root.bind("<Control-KP_Enter>", lambda _e: self.add_order(), add="+")
+
         self.refresh_orders(initial_fetch=True)
 
     def _process_ui_queue(self):
@@ -415,10 +422,6 @@ class AppGUI:
                 result = work_fn()
                 if on_ok:
                     self.ui_queue.put(lambda: on_ok(result))
-            except LicenseKick as e:
-                # Show message and exit immediately
-                self.ui_queue.put(lambda: error(self.root, "Доступ отключён", "Срок действия ключа истёк"))
-                self.ui_queue.put(lambda: self.root.after(200, lambda: os._exit(0)))
             except Exception as e:
                 if on_err:
                     self.ui_queue.put(lambda: on_err(e))
@@ -516,22 +519,70 @@ class AppGUI:
             ], "sticky": "we"})
         ])
 
-    def add_placeholder(self, entry, text):
+    # ===================== PLACEHOLDERS (fixed) =====================
+    def _ph_is_active(self, entry: tk.Entry) -> bool:
+        return bool(getattr(entry, "_ph_active", False))
+
+    def _ph_text(self, entry: tk.Entry) -> str:
+        return str(getattr(entry, "_ph_text", ""))
+
+    def _ph_set(self, entry: tk.Entry, text: str) -> None:
+        """Поставить placeholder так, чтобы он НЕ считался введённым текстом."""
+        entry._ph_text = text
+        entry._ph_active = True
+        entry.delete(0, tk.END)
         entry.insert(0, text)
         entry.config(fg=PLACEHOLDER_FG)
 
+    def _ph_clear(self, entry: tk.Entry) -> None:
+        """Очистить placeholder (если активен)."""
+        if self._ph_is_active(entry):
+            entry._ph_active = False
+            entry.delete(0, tk.END)
+            entry.config(fg=ENTRY_FG)
+
+    def get_entry_value(self, entry: tk.Entry) -> str:
+        if self._ph_is_active(entry):
+            return ""
+        return entry.get().strip()
+
+    def add_placeholder(self, entry: tk.Entry, text: str) -> None:
+        self._ph_set(entry, text)
+
         def on_focus_in(_event):
-            if entry.get() == text:
+            self._ph_clear(entry)
+
+        def on_focus_out(_event):
+            if not entry.get().strip():
+                self._ph_set(entry, self._ph_text(entry))
+
+        entry.bind("<Button-1>", on_focus_in, add="+")
+        entry.bind("<FocusIn>", on_focus_in, add="+")
+        entry.bind("<FocusOut>", on_focus_out, add="+")
+
+    def reset_left_fields(self) -> None:
+        for label, entry in self.entries.items():
+            ph = self.entry_placeholders.get(label, "")
+            if ph:
+                self._ph_set(entry, ph)
+            else:
                 entry.delete(0, tk.END)
                 entry.config(fg=ENTRY_FG)
 
-        def on_focus_out(_event):
-            if not entry.get():
-                entry.insert(0, text)
-                entry.config(fg=PLACEHOLDER_FG)
-
-        entry.bind("<FocusIn>", on_focus_in)
-        entry.bind("<FocusOut>", on_focus_out)
+    def on_escape(self, _event=None):
+        try:
+            self.reset_left_fields()
+        except Exception:
+            pass
+        try:
+            self.tree.selection_remove(self.tree.selection())
+        except Exception:
+            pass
+        try:
+            self.offers.selection_remove(self.offers.selection())
+        except Exception:
+            pass
+        return "break"
 
     def build_left_panel(self):
         left = tk.Frame(self.root, bg=BG_PANEL, padx=12, pady=12)
@@ -548,12 +599,16 @@ class AppGUI:
         ]
 
         self.entries = {}
+        self.entry_placeholders = {}
         for label, placeholder in fields:
             tk.Label(left, text=label, bg=BG_PANEL, fg=FG_TEXT).pack(anchor="w")
             e = tk.Entry(left, bg=ENTRY_BG, fg=ENTRY_FG, width=35, insertbackground="white")
             e.pack(pady=4)
             self.entries[label] = e
+            self.entry_placeholders[label] = placeholder
             self.add_placeholder(e, placeholder)
+            e.bind("<Return>", lambda _e: self.add_order(), add="+")
+            e.bind("<KP_Enter>", lambda _e: self.add_order(), add="+")
 
     def build_top_buttons(self):
         top = tk.Frame(self.root, bg=BG_MAIN)
@@ -693,18 +748,8 @@ class AppGUI:
         try:
             data = {}
             for label, entry in self.entries.items():
-                val = entry.get().strip()
-                if val in (
-                    "Введите направление",
-                    "Введите груз",
-                    "Введите тонну",
-                    "Введите тип транспорта",
-                    "Введите дату",
-                    "Введите цену",
-                    "Необязательно",
-                ):
-                    val = ""
-                data[label] = val
+                # placeholder никогда не попадает в данные
+                data[label] = self.get_entry_value(entry)
 
             required_fields = {
                 "Направление": data["Направление"],
@@ -757,25 +802,10 @@ class AppGUI:
             )
             self.id_map[item] = order
 
-            for label, entry in self.entries.items():
-                entry.delete(0, tk.END)
-                placeholder = (
-                    "Введите направление"
-                    if label == "Направление"
-                    else "Введите груз"
-                    if label == "Груз"
-                    else "Введите тонну"
-                    if label == "Тоннаж"
-                    else "Введите тип транспорта"
-                    if label == "Тип транспорта"
-                    else "Введите дату"
-                    if label == "Дата"
-                    else "Введите цену"
-                    if label == "Цена"
-                    else "Необязательно"
-                )
-                entry.insert(0, placeholder)
-                entry.config(fg=PLACEHOLDER_FG)
+
+            # корректный сброс полей обратно к подсказкам
+            self.reset_left_fields()
+
 
         except Exception as e:
             error(self.root, "Ошибка", f"Неверный ввод данных заявки\n\n{e}")
@@ -873,7 +903,9 @@ class AppGUI:
                             warn(self.root, "Внимание", "Сервер не вернул ID заявки.")
                     else:
                         j = safe_json(resp)
-                        error(self.root, "Ошибка", f"Не удалось отправить заявку")
+                        error(self.root, "Ошибка", f"Не удалось отправить заявку\n"
+                              f"HTTP {resp.status_code}\n"
+                              f"{j.get('error') or j.get('message') or resp.text}")
                 except Exception as e:
                     error(self.root, "Ошибка", f"Ошибка при отправке: {e}")
 
@@ -1202,19 +1234,19 @@ def login_to_server(root: tk.Tk) -> Optional[str]:
             )
             if r.status_code != 200:
                 j = safe_json(r)
-                # Make license-related problems human-friendly
-                if isinstance(j, dict) and j.get("error") in ("license_inactive", "license_expired", "license_not_found"):
-                    code_msg = {
-                        "license_inactive": "Ключ продукта отключён администратором.",
-                        "license_expired": "Срок действия ключа продукта истёк.",
-                        "license_not_found": "Ключ продукта не найден.",
-                    }.get(j.get("error"), "Доступ по ключу продукта недоступен.")
-                    error(win, "Доступ отключён", f"{code_msg}")
+                # License check is centralized: if key is invalid, stop the whole chain and exit.
+                if isinstance(j, dict) and j.get("error") in (
+                    "license_inactive", "license_expired", "license_not_found",
+                    "license_app_mismatch", "device_limit_reached",
+                ):
+                    exit_app(win, "Ключ продукта недействителен")
                 else:
-                    error(win, "Ошибка", f"Не удалось авторизоваться")
+                    error(win, "Ошибка", "Не удалось авторизоваться")
                 return
 
             data = r.json()
+            if isinstance(data, dict) and data.get('license_valid') is False:
+                exit_app(win, 'Ключ продукта недействителен')
             token = data.get("token")
             role = (data.get("role") or "").lower()
 
@@ -1308,7 +1340,12 @@ def login_to_server(root: tk.Tk) -> Optional[str]:
 
                 if r.status_code != 201:
                     j = safe_json(r)
-                    error(reg, "Ошибка", f"Не удалось зарегистрироваться")
+                    if isinstance(j, dict) and j.get("error") in (
+                        "license_inactive", "license_expired", "license_not_found",
+                        "license_app_mismatch", "device_limit_reached",
+                    ):
+                        exit_app(reg, "Ключ продукта недействителен")
+                    error(reg, "Ошибка", "Не удалось зарегистрироваться")
                     return
 
                 info(reg, "Готово", "Аккаунт создан")
