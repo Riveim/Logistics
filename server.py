@@ -1,4 +1,4 @@
-﻿# server.py
+# server.py
 # -*- coding: utf-8 -*-
 import os
 import time
@@ -477,32 +477,9 @@ def require_auth():
     if not meta:
         return None, jsonify({"error": "bad/expired token"}), 401
 
-    # If user was registered via a product license key, enforce that license is still active.
-    # This makes it possible to "turn off" the whole company by disabling their key.
-    try:
-        username = meta.get("username")
-        app_name = (meta.get("app") or "").strip().lower()
-        if username:
-            conn = db_connect()
-            try:
-                cur = conn.cursor()
-                cur.execute("SELECT license_key_used, device_id FROM users WHERE username=?", (username,))
-                row = cur.fetchone()
-                if row:
-                    lk = (row["license_key_used"] or "").strip()
-                    dev = (row["device_id"] or "").strip()
-                    if lk:
-                        ok, reason, _meta2 = validate_license_and_touch(conn, lk, app_name or "manager", dev or "0")
-                        if not ok:
-                            conn.rollback()
-                            revoke_all_tokens_for(username)
-                            return None, jsonify({"error": reason}), 403
-                        conn.commit()
-            finally:
-                conn.close()
-    except Exception:
-        # Do not crash auth; if DB issue, treat as server error
-        return None, jsonify({"error": "license_check_failed"}), 500
+    # License validity is checked only during /login and /register.
+    # We do NOT enforce license status on every API call here, so an already logged-in session
+    # won't be interrupted mid-work.
 
     return meta, None, None
 
@@ -713,7 +690,7 @@ def register():
             ok2, reason2, meta = validate_license_and_touch(conn, license_key, role, device_id or "0")
             if not ok2:
                 conn.rollback()
-                return jsonify({"error": reason2, **meta}), 403
+                return jsonify({"error": reason2, "license_valid": False, **meta}), 403
 
 
         cur.execute(
@@ -722,7 +699,7 @@ def register():
             (username, sha256(password), role, email, phone, company_name, contact, (device_id or None), (meta.get("license_key") if not invite_code else None), now_ts()),
         )
         conn.commit()
-        return jsonify({"status": "ok"}), 201
+        return jsonify({"status": "ok", "license_valid": True}), 201
     finally:
         conn.close()
 
@@ -780,14 +757,14 @@ def login():
             if not ok_lk:
                 conn.rollback()
                 revoke_all_tokens_for(username)
-                return jsonify({"error": reason_lk, **meta_lk}), 403
+                return jsonify({"error": reason_lk, "license_valid": False, **meta_lk}), 403
             conn.commit()
 
         if SINGLE_SESSION_PER_USER:
             revoke_all_tokens_for(username)
 
         token = issue_token(username, role, app_name)
-        return jsonify({"token": token, "role": role}), 200
+        return jsonify({"token": token, "role": role, "license_valid": True}), 200
     finally:
         conn.close()
 
