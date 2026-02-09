@@ -1,8 +1,4 @@
 # telegram_app.py
-# Рассылает заявки в личку водителям из списка USERS и принимает их ответы.
-# Полученные ответы (офферы) отправляет на server.py, где они объединяются с откликами из transport_app.
-#
-# pip install telethon fastapi uvicorn requests
 
 import os
 import re
@@ -38,8 +34,6 @@ SEND_POLL_INTERVAL = float(os.getenv("TG_SEND_POLL_INTERVAL", "1.0"))
 SEND_THROTTLE_SEC = float(os.getenv("TG_SEND_THROTTLE_SEC", "0.4"))
 
 # ================== RECIPIENTS ==================
-# Кому рассылать (Telegram user IDs)
-# Можно передать через env: TG_USERS="123,456,789"
 TG_USERS={5112013904,
     7966902342,
     118359043,
@@ -883,6 +877,7 @@ async def startup():
 
 if __name__ == "__main__":
     uvicorn.run(app, host=HOST, port=PORT)
+
 
 
 
