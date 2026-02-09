@@ -40,7 +40,7 @@ SEND_THROTTLE_SEC = float(os.getenv("TG_SEND_THROTTLE_SEC", "0.4"))
 # ================== RECIPIENTS ==================
 # Кому рассылать (Telegram user IDs)
 # Можно передать через env: TG_USERS="123,456,789"
-TG_USERS="5112013904,
+TG_USERS={5112013904,
     7966902342,
     118359043,
     1817780335,
@@ -628,7 +628,7 @@ TG_USERS="5112013904,
     679100786,
     1799175967,
     5164706689,
-    7613106408"
+    7613106408}
 _users_env = (os.getenv("TG_USERS", "") or "").strip()
 if _users_env:
     USERS = {int(x.strip()) for x in _users_env.split(",") if x.strip().isdigit()}
@@ -883,4 +883,5 @@ async def startup():
 
 if __name__ == "__main__":
     uvicorn.run(app, host=HOST, port=PORT)
+
 
