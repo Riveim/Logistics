@@ -29,7 +29,7 @@ app = FastAPI()
 SERVER_HOST = "0.0.0.0"
 SERVER_PORT = 8000
 
-TELEGRAM_APP_URL = "http://127.0.0.1:5000/send_order"  # <-- ИЗМЕНИ если нужно
+TELEGRAM_APP_URL = "http://127.0.0.1:8001/send_order"  # <-- ИЗМЕНИ если нужно
 VALID_TOKEN = "SECRET_TOKEN"
 
 
