@@ -43,6 +43,7 @@ else:
 
 # ================== STORAGE ==================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+USERS_FILE = os.getenv("TG_USERS_FILE", os.path.join(BASE_DIR, "tg_users.txt"))
 MAP_PATH = os.path.join(BASE_DIR, "tg_order_msg_map.json")
 
 # (uid, msg_id) -> order_id
@@ -79,6 +80,21 @@ def load_map() -> None:
     except Exception:
         order_msg_map = {}
 
+def load_users() -> set[int]:
+    users: set[int] = set()
+    try:
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                if s.isdigit():
+                    users.add(int(s))
+    except Exception as e:
+        print("[TG] users file load error:", e)
+    return users
+
+USERS = load_users()
 
 def save_map() -> None:
     try:
@@ -288,6 +304,7 @@ async def startup():
 
 if __name__ == "__main__":
     uvicorn.run(app, host=HOST, port=PORT)
+
 
 
 
