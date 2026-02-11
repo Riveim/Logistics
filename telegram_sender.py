@@ -5,7 +5,7 @@ import os
 import time
 import sqlite3
 import asyncio
-from typing import Optional, List, Dict, Any, Literal
+from typing import Optional, List, Dict, Any, Literal, Tuple
 
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
@@ -13,42 +13,38 @@ from pydantic import BaseModel, Field
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, RPCError
 
+
 # ================== ENV ==================
-# (Лучше хранить в .env на сервере, но чтобы "просто вставил и работало" — оставляю твой вариант)
 TG_API_ID = int(os.getenv("TG_API_ID", "37930540"))
 TG_API_HASH = os.getenv("TG_API_HASH", "d94a6e7d6ccc9f931e93db1f3097b079")
-
-# ВАЖНО: это имя файловой сессии telethon. Создаст файл tg_session2.session рядом со скриптом
 TG_SESSION_NAME = os.getenv("TG_SESSION_STRING", "tg_session2")
 
 SENDER_HOST = os.getenv("SENDER_HOST", "127.0.0.1")
 SENDER_PORT = int(os.getenv("SENDER_PORT", "5000"))
 
-# --- FIX: DB_PATH ---
-# На Linux по умолчанию /opt/telegram_sender/sender.db
-# На Windows по умолчанию ./sender.db рядом со скриптом
-DEFAULT_DB_LINUX = "/opt/telegram_sender/sender.db"
-DEFAULT_DB_WINDOWS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sender.db")
-DB_PATH = os.getenv("DB_PATH", DEFAULT_DB_WINDOWS if os.name == "nt" else DEFAULT_DB_LINUX)
+DB_PATH = os.getenv("DB_PATH", "/opt/telegram_sender/sender.db")
 
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")  # на Windows может быть пустым, на сервере поставь обязательно
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
 GROUP_PERIOD_MINUTES = int(os.getenv("GROUP_PERIOD_MINUTES", "30"))
-
 MAX_MSG_PER_MIN = int(os.getenv("MAX_MSG_PER_MIN", "18"))
 MAX_MSG_PER_HOUR = int(os.getenv("MAX_MSG_PER_HOUR", "300"))
+MSG_MAX = 3900
 
-MSG_MAX = 3900  # safety
+# файл, который ты будешь заполнять по SSH/service
+TARGETS_TXT = os.getenv("TARGETS_TXT", "/opt/telegram_sender/tg_users.txt")
+TARGETS_SYNC_SECONDS = int(os.getenv("TARGETS_SYNC_SECONDS", "30"))  # как часто перечитывать файл
 
 if not TG_API_ID or not TG_API_HASH or not TG_SESSION_NAME:
-    raise RuntimeError("Set TG_API_ID, TG_API_HASH, TG_SESSION_STRING (session name) in env")
+    raise RuntimeError("Set TG_API_ID, TG_API_HASH, TG_SESSION_STRING in env")
+
 
 # ================== DB ==================
 def _ensure_db_dir():
-    # если DB_PATH включает папку — создаём её
     parent = os.path.dirname(os.path.abspath(DB_PATH))
     if parent and not os.path.exists(parent):
         os.makedirs(parent, exist_ok=True)
+
 
 def db() -> sqlite3.Connection:
     _ensure_db_dir()
@@ -57,8 +53,10 @@ def db() -> sqlite3.Connection:
     con.execute("PRAGMA synchronous=NORMAL;")
     return con
 
+
 def now_ts() -> int:
     return int(time.time())
+
 
 def init_db():
     con = db()
@@ -69,7 +67,7 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         kind TEXT NOT NULL,          -- 'group' or 'dm'
         name TEXT,
-        peer TEXT NOT NULL UNIQUE,   -- '@username' or numeric chat_id
+        peer TEXT NOT NULL UNIQUE,   -- '@username' or numeric id (chat_id/user_id)
         created_at INTEGER NOT NULL
     )
     """)
@@ -90,7 +88,7 @@ def init_db():
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS cursors (
-        kind TEXT NOT NULL,          -- 'group' or 'dm'
+        kind TEXT NOT NULL,
         peer TEXT NOT NULL,
         last_order_id INTEGER NOT NULL DEFAULT 0,
         updated_at INTEGER NOT NULL,
@@ -108,9 +106,11 @@ def init_db():
     con.commit()
     con.close()
 
+
 def get_counter(con: sqlite3.Connection, key: str) -> int:
     row = con.execute("SELECT value FROM counters WHERE key=?", (key,)).fetchone()
     return int(row[0]) if row else 0
+
 
 def set_counter(con: sqlite3.Connection, key: str, value: int) -> None:
     con.execute(
@@ -120,12 +120,14 @@ def set_counter(con: sqlite3.Connection, key: str, value: int) -> None:
     )
     con.commit()
 
+
 def get_cursor(con: sqlite3.Connection, kind: str, peer: str) -> int:
     row = con.execute(
         "SELECT last_order_id FROM cursors WHERE kind=? AND peer=?",
         (kind, peer)
     ).fetchone()
     return int(row[0]) if row else 0
+
 
 def set_cursor(con: sqlite3.Connection, kind: str, peer: str, last_order_id: int) -> None:
     con.execute(
@@ -135,45 +137,20 @@ def set_cursor(con: sqlite3.Connection, kind: str, peer: str, last_order_id: int
     )
     con.commit()
 
-# ================== API MODELS ==================
-class OrderIn(BaseModel):
-    direction: str = Field("", description="Откуда - Куда")
-    cargo: str = Field("", description="Груз")
-    tonnage: float = Field(0, description="Тоннаж")
-    truck: str = Field("", description="Тип транспорта")
-    price: Optional[float] = Field(None, description="Цена")
-    date: Optional[str] = Field(None, description="Дата")
-    info: Optional[str] = Field(None, description="Требования/инфо")
-
-class TargetIn(BaseModel):
-    kind: Literal["group", "dm"]
-    peer: str = Field(..., description="@username или chat_id (-100...)")
-    name: Optional[str] = None
-
-# ================== AUTH ==================
-def require_token(x_admin_token: Optional[str]) -> None:
-    # на сервере токен обязателен
-    if not ADMIN_TOKEN:
-        raise HTTPException(status_code=500, detail="ADMIN_TOKEN is empty. Set it in .env on the server.")
-    if x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid admin token")
 
 # ================== TELEGRAM ==================
-# ВАЖНО: это файловая сессия tg_session2.session
 client = TelegramClient(TG_SESSION_NAME, TG_API_ID, TG_API_HASH)
 rate_lock = asyncio.Lock()
 
+
 async def ensure_client():
-    """
-    FIX: теперь при первом запуске не падает,
-    а запускает интерактивный логин (номер/код/2FA) и создаёт tg_session2.session
-    """
     if not client.is_connected():
         await client.connect()
-
     if not await client.is_user_authorized():
-        # Telethon сам спросит номер/код/пароль в консоли
+        # если сессия уже есть — просто авторизуется
+        # если нет — попросит номер/код/2FA (но у тебя уже есть .session)
         await client.start()
+
 
 async def rate_limit_ok():
     async with rate_lock:
@@ -209,9 +186,98 @@ async def rate_limit_ok():
         set_counter(con, "hour_count", hour_count + 1)
         con.close()
 
+
 def _clean(s: Optional[str]) -> str:
     return (s or "").strip()
 
+
+# ================== Targets sync from tg_users.txt ==================
+def parse_targets_file(path: str) -> List[Tuple[str, str, Optional[str]]]:
+    """
+    Returns list of (kind, peer, name)
+    kind in {'group','dm'}
+    """
+    items: List[Tuple[str, str, Optional[str]]] = []
+    if not os.path.exists(path):
+        return items
+
+    with open(path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            # Split optional name
+            name = None
+            if "|" in line:
+                left, right = line.split("|", 1)
+                line = left.strip()
+                name = right.strip() or None
+
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+
+            typ = parts[0].strip().upper()
+            peer = parts[1].strip()
+
+            if typ == "GROUP":
+                kind = "group"
+            elif typ == "DM":
+                kind = "dm"
+            else:
+                continue
+
+            if not peer:
+                continue
+
+            # Basic validation: @username or number (including -100...)
+            if not (peer.startswith("@") or peer.lstrip("-").isdigit()):
+                continue
+
+            items.append((kind, peer, name))
+
+    return items
+
+
+def upsert_target(con: sqlite3.Connection, kind: str, peer: str, name: Optional[str]):
+    # insert if missing
+    try:
+        con.execute(
+            "INSERT INTO targets(kind,name,peer,created_at) VALUES (?,?,?,?)",
+            (kind, name, peer, now_ts())
+        )
+        con.commit()
+    except sqlite3.IntegrityError:
+        # already exists; maybe update name/kind if changed
+        con.execute("UPDATE targets SET kind=?, name=? WHERE peer=?", (kind, name, peer))
+        con.commit()
+
+
+async def targets_sync_loop():
+    """
+    Every TARGETS_SYNC_SECONDS: read tg_users.txt and sync into DB targets.
+    Does NOT delete targets from DB (safe). If you need deletion—say, I'll add.
+    """
+    last_mtime = 0.0
+    while True:
+        try:
+            if os.path.exists(TARGETS_TXT):
+                mtime = os.path.getmtime(TARGETS_TXT)
+                if mtime != last_mtime:
+                    last_mtime = mtime
+                    items = parse_targets_file(TARGETS_TXT)
+                    con = db()
+                    for kind, peer, name in items:
+                        upsert_target(con, kind, peer, name)
+                    con.close()
+        except Exception:
+            pass
+
+        await asyncio.sleep(max(5, TARGETS_SYNC_SECONDS))
+
+
+# ================== Message formatting ==================
 def format_order_block(idx: int, o: Dict[str, Any]) -> str:
     direction = _clean(o.get("direction"))
     cargo = _clean(o.get("cargo"))
@@ -238,6 +304,7 @@ def format_order_block(idx: int, o: Dict[str, Any]) -> str:
 
     return "\n".join(lines)
 
+
 def chunk_messages(blocks: List[str]) -> List[str]:
     out: List[str] = []
     cur = ""
@@ -253,7 +320,8 @@ def chunk_messages(blocks: List[str]) -> List[str]:
         out.append(cur.strip())
     return out
 
-def fetch_new_orders(con: sqlite3.Connection, after_id: int, limit: int = 200) -> List[Dict[str, Any]]:
+
+def fetch_new_orders(con: sqlite3.Connection, after_id: int, limit: int = 300) -> List[Dict[str, Any]]:
     rows = con.execute(
         "SELECT id, direction, cargo, tonnage, truck, price, date, info, created_at "
         "FROM orders WHERE id>? ORDER BY id ASC LIMIT ?",
@@ -274,13 +342,14 @@ def fetch_new_orders(con: sqlite3.Connection, after_id: int, limit: int = 200) -
         for r in rows
     ]
 
+
 async def send_to_target(kind: str, peer: str) -> Dict[str, Any]:
     await ensure_client()
 
     con = db()
     try:
         last_id = get_cursor(con, kind, peer)
-        orders = fetch_new_orders(con, last_id, limit=300)
+        orders = fetch_new_orders(con, last_id)
         if not orders:
             return {"peer": peer, "sent": 0, "last_id": last_id, "status": "no_new"}
 
@@ -306,19 +375,41 @@ async def send_to_target(kind: str, peer: str) -> Dict[str, Any]:
     finally:
         con.close()
 
+
 # ================== FASTAPI ==================
-app = FastAPI(title="Telegram Sender (Groups every 30m + manual DM)")
+app = FastAPI(title="Telegram Sender (groups every 30m + manual DM; targets from tg_users.txt)")
 
 init_db()
+
+
+class OrderIn(BaseModel):
+    direction: str = Field("", description="Откуда - Куда")
+    cargo: str = Field("", description="Груз")
+    tonnage: float = Field(0, description="Тоннаж")
+    truck: str = Field("", description="Тип транспорта")
+    price: Optional[float] = Field(None, description="Цена")
+    date: Optional[str] = Field(None, description="Дата")
+    info: Optional[str] = Field(None, description="Требования/инфо")
+
+
+def require_token(x_admin_token: Optional[str]) -> None:
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=500, detail="ADMIN_TOKEN is empty. Set it in .env.")
+    if x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid admin token")
+
 
 @app.on_event("startup")
 async def startup():
     await ensure_client()
+    asyncio.create_task(targets_sync_loop())
     asyncio.create_task(group_scheduler_loop())
+
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "host": SENDER_HOST, "port": SENDER_PORT, "db": DB_PATH, "session": TG_SESSION_NAME}
+    return {"ok": True, "host": SENDER_HOST, "port": SENDER_PORT, "db": DB_PATH, "targets_file": TARGETS_TXT}
+
 
 @app.post("/send_order")
 async def send_order(order: OrderIn):
@@ -354,29 +445,6 @@ async def send_order(order: OrderIn):
 
     return {"status": "ok"}
 
-@app.post("/targets/add")
-async def targets_add(t: TargetIn, x_admin_token: Optional[str] = Header(None)):
-    require_token(x_admin_token)
-
-    peer = (t.peer or "").strip()
-    if not peer:
-        raise HTTPException(400, detail="peer is empty")
-    if not (peer.startswith("@") or peer.lstrip("-").isdigit()):
-        raise HTTPException(400, detail="peer must be @username or numeric chat_id")
-
-    con = db()
-    try:
-        con.execute(
-            "INSERT INTO targets(kind,name,peer,created_at) VALUES (?,?,?,?)",
-            (t.kind, t.name, peer, now_ts())
-        )
-        con.commit()
-    except sqlite3.IntegrityError:
-        raise HTTPException(409, detail="target already exists")
-    finally:
-        con.close()
-
-    return {"ok": True, "kind": t.kind, "peer": peer}
 
 @app.get("/targets/list")
 async def targets_list(x_admin_token: Optional[str] = Header(None)):
@@ -386,18 +454,12 @@ async def targets_list(x_admin_token: Optional[str] = Header(None)):
     con.close()
     return [{"kind": r[0], "name": r[1], "peer": r[2], "created_at": r[3]} for r in rows]
 
-@app.post("/targets/remove")
-async def targets_remove(peer: str, x_admin_token: Optional[str] = Header(None)):
-    require_token(x_admin_token)
-    peer = (peer or "").strip()
-    con = db()
-    cur = con.execute("DELETE FROM targets WHERE peer=?", (peer,))
-    con.commit()
-    con.close()
-    return {"ok": True, "deleted": cur.rowcount}
 
 @app.post("/dms/send_now")
 async def dms_send_now(x_admin_token: Optional[str] = Header(None)):
+    """
+    Manual DM send (call via SSH): sends new orders to all dm targets.
+    """
     require_token(x_admin_token)
 
     con = db()
@@ -410,8 +472,12 @@ async def dms_send_now(x_admin_token: Optional[str] = Header(None)):
     results = [await send_to_target("dm", p) for p in peers]
     return {"ok": True, "results": results}
 
+
 @app.post("/groups/send_now")
 async def groups_send_now(x_admin_token: Optional[str] = Header(None)):
+    """
+    Manual group send (optional).
+    """
     require_token(x_admin_token)
 
     con = db()
@@ -424,7 +490,11 @@ async def groups_send_now(x_admin_token: Optional[str] = Header(None)):
     results = [await send_to_target("group", p) for p in peers]
     return {"ok": True, "results": results}
 
+
 async def group_scheduler_loop():
+    """
+    Every GROUP_PERIOD_MINUTES: send new orders to each group target.
+    """
     while True:
         try:
             con = db()
