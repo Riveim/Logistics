@@ -17,7 +17,7 @@ from telethon.errors import FloodWaitError, RPCError
 # ================== ENV ==================
 TG_API_ID = int(os.getenv("TG_API_ID", "37930540"))
 TG_API_HASH = os.getenv("TG_API_HASH", "d94a6e7d6ccc9f931e93db1f3097b079")
-TG_SESSION_NAME = os.getenv("TG_SESSION_STRING", "tg_session2")
+TG_SESSION_STRING = os.getenv("TG_SESSION_STRING", "tg_session2")
 
 SENDER_HOST = os.getenv("SENDER_HOST", "127.0.0.1")
 SENDER_PORT = int(os.getenv("SENDER_PORT", "5000"))
@@ -27,23 +27,37 @@ DB_PATH = os.getenv("DB_PATH", "/opt/telegram_sender/sender.db")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
 GROUP_PERIOD_MINUTES = int(os.getenv("GROUP_PERIOD_MINUTES", "30"))
+
 MAX_MSG_PER_MIN = int(os.getenv("MAX_MSG_PER_MIN", "18"))
 MAX_MSG_PER_HOUR = int(os.getenv("MAX_MSG_PER_HOUR", "300"))
+
+# message limit safety (Telegram ~4096 chars)
 MSG_MAX = 3900
 
-# файл, который ты будешь заполнять по SSH/service
-TARGETS_TXT = os.getenv("TARGETS_TXT", "/opt/telegram_sender/tg_users.txt")
-TARGETS_SYNC_SECONDS = int(os.getenv("TARGETS_SYNC_SECONDS", "30"))  # как часто перечитывать файл
+# File with targets (your tg_users.txt)
+TG_USERS_FILE = os.getenv("TG_USERS_FILE", "/opt/telegram_sender/tg_users.txt")
 
-if not TG_API_ID or not TG_API_HASH or not TG_SESSION_NAME:
-    raise RuntimeError("Set TG_API_ID, TG_API_HASH, TG_SESSION_STRING in env")
+# How often we allow to resync (seconds) when file changes
+TARGETS_SYNC_MIN_INTERVAL = int(os.getenv("TARGETS_SYNC_MIN_INTERVAL", "2"))
+
+if not TG_API_ID or not TG_API_HASH or not TG_SESSION_STRING:
+    raise RuntimeError("Set TG_API_ID, TG_API_HASH, TG_SESSION_STRING in env (.env)")
+
+
+# ================== HELPERS ==================
+def now_ts() -> int:
+    return int(time.time())
+
+
+def _clean(s: Optional[str]) -> str:
+    return (s or "").strip()
 
 
 # ================== DB ==================
 def _ensure_db_dir():
-    parent = os.path.dirname(os.path.abspath(DB_PATH))
-    if parent and not os.path.exists(parent):
-        os.makedirs(parent, exist_ok=True)
+    d = os.path.dirname(DB_PATH)
+    if d:
+        os.makedirs(d, exist_ok=True)
 
 
 def db() -> sqlite3.Connection:
@@ -52,10 +66,6 @@ def db() -> sqlite3.Connection:
     con.execute("PRAGMA journal_mode=WAL;")
     con.execute("PRAGMA synchronous=NORMAL;")
     return con
-
-
-def now_ts() -> int:
-    return int(time.time())
 
 
 def init_db():
@@ -67,7 +77,7 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         kind TEXT NOT NULL,          -- 'group' or 'dm'
         name TEXT,
-        peer TEXT NOT NULL UNIQUE,   -- '@username' or numeric id (chat_id/user_id)
+        peer TEXT NOT NULL UNIQUE,   -- '@username' or numeric chat_id
         created_at INTEGER NOT NULL
     )
     """)
@@ -88,7 +98,7 @@ def init_db():
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS cursors (
-        kind TEXT NOT NULL,
+        kind TEXT NOT NULL,          -- 'group' or 'dm'
         peer TEXT NOT NULL,
         last_order_id INTEGER NOT NULL DEFAULT 0,
         updated_at INTEGER NOT NULL,
@@ -138,8 +148,172 @@ def set_cursor(con: sqlite3.Connection, kind: str, peer: str, last_order_id: int
     con.commit()
 
 
+def clear_orders_and_cursors(con: sqlite3.Connection) -> None:
+    con.execute("DELETE FROM orders")
+    con.execute("DELETE FROM cursors")
+    con.commit()
+
+
+# ================== TARGETS FILE (tg_users.txt) ==================
+# Format example:
+#   GROUP 2919779081 | My group
+#   DM @username | Name
+# Comments/empty lines allowed.
+
+_last_targets_mtime: float = 0.0
+_last_targets_sync_ts: int = 0
+
+
+def _parse_targets_file(path: str) -> List[Tuple[str, str, str]]:
+    """
+    Returns list of (kind, peer, name)
+    kind: 'group' or 'dm'
+    peer: '@username' or numeric chat_id (preferred for groups: -100....)
+    """
+    if not path or not os.path.exists(path):
+        return []
+
+    out: List[Tuple[str, str, str]] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for raw in f.readlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            # Split by |
+            left, name = (line, "")
+            if "|" in line:
+                left, name = [p.strip() for p in line.split("|", 1)]
+
+            parts = left.split()
+            if len(parts) < 2:
+                continue
+
+            t = parts[0].strip().upper()
+            peer = parts[1].strip()
+
+            if t == "GROUP":
+                kind = "group"
+            elif t == "DM":
+                kind = "dm"
+            else:
+                continue
+
+            # allow @username OR numeric chat id (Telegram groups often -100...)
+            if not (peer.startswith("@") or peer.lstrip("-").isdigit()):
+                # (phone like +998... is NOT reliable; prefer @username)
+                continue
+
+            out.append((kind, peer, name.strip()))
+
+    return out
+
+
+def sync_targets_from_file(force: bool = False) -> Dict[str, Any]:
+    """
+    Sync DB targets with TG_USERS_FILE if file changed.
+    - Adds/updates targets found in file
+    - Removes targets not present in file
+    """
+    global _last_targets_mtime, _last_targets_sync_ts
+
+    if not TG_USERS_FILE:
+        return {"ok": True, "status": "no_file_configured"}
+
+    if not os.path.exists(TG_USERS_FILE):
+        return {"ok": True, "status": "file_not_found", "file": TG_USERS_FILE}
+
+    now = now_ts()
+    if not force and (now - _last_targets_sync_ts) < TARGETS_SYNC_MIN_INTERVAL:
+        return {"ok": True, "status": "cooldown"}
+
+    mtime = os.path.getmtime(TG_USERS_FILE)
+    if not force and mtime == _last_targets_mtime:
+        _last_targets_sync_ts = now
+        return {"ok": True, "status": "no_changes"}
+
+    items = _parse_targets_file(TG_USERS_FILE)
+    wanted = {(k, p): n for (k, p, n) in items}
+
+    con = db()
+    try:
+        existing = con.execute("SELECT kind, peer, name FROM targets").fetchall()
+        existing_map = {(r[0], r[1]): (r[2] or "") for r in existing}
+
+        # upsert wanted
+        added = 0
+        updated = 0
+        for (kind, peer), name in wanted.items():
+            if (kind, peer) not in existing_map:
+                con.execute(
+                    "INSERT INTO targets(kind,name,peer,created_at) VALUES (?,?,?,?)",
+                    (kind, name, peer, now_ts())
+                )
+                added += 1
+            else:
+                old_name = existing_map[(kind, peer)]
+                if (name or "") != (old_name or ""):
+                    con.execute(
+                        "UPDATE targets SET name=? WHERE kind=? AND peer=?",
+                        (name, kind, peer)
+                    )
+                    updated += 1
+
+        # remove not wanted
+        removed = 0
+        for (kind, peer) in list(existing_map.keys()):
+            if (kind, peer) not in wanted:
+                con.execute("DELETE FROM targets WHERE kind=? AND peer=?", (kind, peer))
+                removed += 1
+
+        con.commit()
+
+        _last_targets_mtime = mtime
+        _last_targets_sync_ts = now
+
+        return {
+            "ok": True,
+            "status": "synced",
+            "file": TG_USERS_FILE,
+            "added": added,
+            "updated": updated,
+            "removed": removed,
+            "total": len(wanted),
+        }
+    finally:
+        con.close()
+
+
+# ================== API MODELS ==================
+class OrderIn(BaseModel):
+    direction: str = Field("", description="Откуда - Куда")
+    cargo: str = Field("", description="Груз")
+    tonnage: float = Field(0, description="Тоннаж")
+    truck: str = Field("", description="Тип транспорта")
+    price: Optional[float] = Field(None, description="Цена")
+    date: Optional[str] = Field(None, description="Дата")
+    info: Optional[str] = Field(None, description="Требования/инфо")
+
+    # Special flag: if true -> clear previous orders/cursors (send only latest batch)
+    reset: Optional[bool] = Field(default=False, alias="__reset")
+
+
+class TargetIn(BaseModel):
+    kind: Literal["group", "dm"]
+    peer: str = Field(..., description="@username или chat_id (-100...)")
+    name: Optional[str] = None
+
+
+# ================== AUTH ==================
+def require_token(x_admin_token: Optional[str]) -> None:
+    if not ADMIN_TOKEN:
+        raise RuntimeError("ADMIN_TOKEN is empty. Set it in .env")
+    if x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid admin token")
+
+
 # ================== TELEGRAM ==================
-client = TelegramClient(TG_SESSION_NAME, TG_API_ID, TG_API_HASH)
+client = TelegramClient(TG_SESSION_STRING, TG_API_ID, TG_API_HASH)
 rate_lock = asyncio.Lock()
 
 
@@ -147,9 +321,7 @@ async def ensure_client():
     if not client.is_connected():
         await client.connect()
     if not await client.is_user_authorized():
-        # если сессия уже есть — просто авторизуется
-        # если нет — попросит номер/код/2FA (но у тебя уже есть .session)
-        await client.start()
+        raise RuntimeError("Telegram session not authorized. Login once to create session.")
 
 
 async def rate_limit_ok():
@@ -187,98 +359,14 @@ async def rate_limit_ok():
         con.close()
 
 
-def _clean(s: Optional[str]) -> str:
-    return (s or "").strip()
-
-
-# ================== Targets sync from tg_users.txt ==================
-def parse_targets_file(path: str) -> List[Tuple[str, str, Optional[str]]]:
-    """
-    Returns list of (kind, peer, name)
-    kind in {'group','dm'}
-    """
-    items: List[Tuple[str, str, Optional[str]]] = []
-    if not os.path.exists(path):
-        return items
-
-    with open(path, "r", encoding="utf-8") as f:
-        for raw in f:
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-
-            # Split optional name
-            name = None
-            if "|" in line:
-                left, right = line.split("|", 1)
-                line = left.strip()
-                name = right.strip() or None
-
-            parts = line.split()
-            if len(parts) < 2:
-                continue
-
-            typ = parts[0].strip().upper()
-            peer = parts[1].strip()
-
-            if typ == "GROUP":
-                kind = "group"
-            elif typ == "DM":
-                kind = "dm"
-            else:
-                continue
-
-            if not peer:
-                continue
-
-            # Basic validation: @username or number (including -100...)
-            if not (peer.startswith("@") or peer.lstrip("-").isdigit()):
-                continue
-
-            items.append((kind, peer, name))
-
-    return items
-
-
-def upsert_target(con: sqlite3.Connection, kind: str, peer: str, name: Optional[str]):
-    # insert if missing
-    try:
-        con.execute(
-            "INSERT INTO targets(kind,name,peer,created_at) VALUES (?,?,?,?)",
-            (kind, name, peer, now_ts())
-        )
-        con.commit()
-    except sqlite3.IntegrityError:
-        # already exists; maybe update name/kind if changed
-        con.execute("UPDATE targets SET kind=?, name=? WHERE peer=?", (kind, name, peer))
-        con.commit()
-
-
-async def targets_sync_loop():
-    """
-    Every TARGETS_SYNC_SECONDS: read tg_users.txt and sync into DB targets.
-    Does NOT delete targets from DB (safe). If you need deletion—say, I'll add.
-    """
-    last_mtime = 0.0
-    while True:
-        try:
-            if os.path.exists(TARGETS_TXT):
-                mtime = os.path.getmtime(TARGETS_TXT)
-                if mtime != last_mtime:
-                    last_mtime = mtime
-                    items = parse_targets_file(TARGETS_TXT)
-                    con = db()
-                    for kind, peer, name in items:
-                        upsert_target(con, kind, peer, name)
-                    con.close()
-        except Exception:
-            pass
-
-        await asyncio.sleep(max(5, TARGETS_SYNC_SECONDS))
-
-
-# ================== Message formatting ==================
 def format_order_block(idx: int, o: Dict[str, Any]) -> str:
+    """
+    1. Направление
+    Груз, тоннаж
+    Тип транспорта
+    Цена (если есть)
+    Дата (если есть)
+    """
     direction = _clean(o.get("direction"))
     cargo = _clean(o.get("cargo"))
     tonnage = o.get("tonnage", 0) or 0
@@ -321,7 +409,7 @@ def chunk_messages(blocks: List[str]) -> List[str]:
     return out
 
 
-def fetch_new_orders(con: sqlite3.Connection, after_id: int, limit: int = 300) -> List[Dict[str, Any]]:
+def fetch_new_orders(con: sqlite3.Connection, after_id: int, limit: int = 200) -> List[Dict[str, Any]]:
     rows = con.execute(
         "SELECT id, direction, cargo, tonnage, truck, price, date, info, created_at "
         "FROM orders WHERE id>? ORDER BY id ASC LIMIT ?",
@@ -349,7 +437,7 @@ async def send_to_target(kind: str, peer: str) -> Dict[str, Any]:
     con = db()
     try:
         last_id = get_cursor(con, kind, peer)
-        orders = fetch_new_orders(con, last_id)
+        orders = fetch_new_orders(con, last_id, limit=300)
         if not orders:
             return {"peer": peer, "sent": 0, "last_id": last_id, "status": "no_new"}
 
@@ -377,42 +465,41 @@ async def send_to_target(kind: str, peer: str) -> Dict[str, Any]:
 
 
 # ================== FASTAPI ==================
-app = FastAPI(title="Telegram Sender (groups every 30m + manual DM; targets from tg_users.txt)")
+app = FastAPI(title="Telegram Sender (groups scheduler + manual DM)")
 
 init_db()
-
-
-class OrderIn(BaseModel):
-    direction: str = Field("", description="Откуда - Куда")
-    cargo: str = Field("", description="Груз")
-    tonnage: float = Field(0, description="Тоннаж")
-    truck: str = Field("", description="Тип транспорта")
-    price: Optional[float] = Field(None, description="Цена")
-    date: Optional[str] = Field(None, description="Дата")
-    info: Optional[str] = Field(None, description="Требования/инфо")
-
-
-def require_token(x_admin_token: Optional[str]) -> None:
-    if not ADMIN_TOKEN:
-        raise HTTPException(status_code=500, detail="ADMIN_TOKEN is empty. Set it in .env.")
-    if x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid admin token")
 
 
 @app.on_event("startup")
 async def startup():
     await ensure_client()
-    asyncio.create_task(targets_sync_loop())
+    # initial sync once
+    try:
+        sync_targets_from_file(force=True)
+    except Exception:
+        pass
     asyncio.create_task(group_scheduler_loop())
 
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "host": SENDER_HOST, "port": SENDER_PORT, "db": DB_PATH, "targets_file": TARGETS_TXT}
+    return {
+        "ok": True,
+        "host": SENDER_HOST,
+        "port": SENDER_PORT,
+        "db": DB_PATH,
+        "session": TG_SESSION_STRING,
+        "tg_users_file": TG_USERS_FILE,
+    }
 
 
+# ---- Orders ----
 @app.post("/send_order")
 async def send_order(order: OrderIn):
+    """
+    Called from your server.py to push a new logistics order.
+    Special: if "__reset": true -> clear previous orders & cursors (only latest batch will be sent).
+    """
     direction = _clean(order.direction)
     cargo = _clean(order.cargo)
     truck = _clean(order.truck)
@@ -426,24 +513,66 @@ async def send_order(order: OrderIn):
         tonnage = 0
 
     con = db()
-    con.execute(
-        "INSERT INTO orders(direction,cargo,tonnage,truck,price,date,info,created_at) "
-        "VALUES (?,?,?,?,?,?,?,?)",
-        (
-            direction,
-            cargo,
-            tonnage,
-            truck,
-            float(order.price) if order.price is not None else None,
-            _clean(order.date) if order.date else None,
-            _clean(order.info) if order.info else None,
-            now_ts(),
-        )
-    )
-    con.commit()
-    con.close()
+    try:
+        if bool(order.reset):
+            clear_orders_and_cursors(con)
 
-    return {"status": "ok"}
+        con.execute(
+            "INSERT INTO orders(direction,cargo,tonnage,truck,price,date,info,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (
+                direction,
+                cargo,
+                tonnage,
+                truck,
+                float(order.price) if order.price is not None else None,
+                _clean(order.date) if order.date else None,
+                _clean(order.info) if order.info else None,
+                now_ts(),
+            )
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    return {"status": "ok", "reset": bool(order.reset)}
+
+
+@app.post("/admin/orders/clear")
+async def admin_orders_clear(x_admin_token: Optional[str] = Header(None)):
+    require_token(x_admin_token)
+    con = db()
+    try:
+        clear_orders_and_cursors(con)
+    finally:
+        con.close()
+    return {"ok": True}
+
+
+# ---- Targets (DB) ----
+@app.post("/targets/add")
+async def targets_add(t: TargetIn, x_admin_token: Optional[str] = Header(None)):
+    require_token(x_admin_token)
+
+    peer = (t.peer or "").strip()
+    if not peer:
+        raise HTTPException(400, detail="peer is empty")
+    if not (peer.startswith("@") or peer.lstrip("-").isdigit()):
+        raise HTTPException(400, detail="peer must be @username or numeric chat_id")
+
+    con = db()
+    try:
+        con.execute(
+            "INSERT INTO targets(kind,name,peer,created_at) VALUES (?,?,?,?)",
+            (t.kind, t.name, peer, now_ts())
+        )
+        con.commit()
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, detail="target already exists")
+    finally:
+        con.close()
+
+    return {"ok": True, "kind": t.kind, "peer": peer}
 
 
 @app.get("/targets/list")
@@ -455,12 +584,36 @@ async def targets_list(x_admin_token: Optional[str] = Header(None)):
     return [{"kind": r[0], "name": r[1], "peer": r[2], "created_at": r[3]} for r in rows]
 
 
+@app.post("/targets/remove")
+async def targets_remove(peer: str, x_admin_token: Optional[str] = Header(None)):
+    require_token(x_admin_token)
+    peer = (peer or "").strip()
+    con = db()
+    cur = con.execute("DELETE FROM targets WHERE peer=?", (peer,))
+    con.commit()
+    con.close()
+    return {"ok": True, "deleted": cur.rowcount}
+
+
+@app.post("/targets/sync_from_file")
+async def targets_sync_from_file(x_admin_token: Optional[str] = Header(None)):
+    require_token(x_admin_token)
+    return sync_targets_from_file(force=True)
+
+
+# ---- Sending ----
 @app.post("/dms/send_now")
 async def dms_send_now(x_admin_token: Optional[str] = Header(None)):
     """
-    Manual DM send (call via SSH): sends new orders to all dm targets.
+    Manual DM send (call via SSH). Sends new orders to all dm targets.
     """
     require_token(x_admin_token)
+
+    # reload tg_users if changed
+    try:
+        sync_targets_from_file(force=False)
+    except Exception:
+        pass
 
     con = db()
     peers = [r[0] for r in con.execute("SELECT peer FROM targets WHERE kind='dm' ORDER BY id ASC").fetchall()]
@@ -469,7 +622,10 @@ async def dms_send_now(x_admin_token: Optional[str] = Header(None)):
     if not peers:
         return {"ok": True, "status": "no_dm_targets"}
 
-    results = [await send_to_target("dm", p) for p in peers]
+    results = []
+    for p in peers:
+        results.append(await send_to_target("dm", p))
+
     return {"ok": True, "results": results}
 
 
@@ -480,6 +636,12 @@ async def groups_send_now(x_admin_token: Optional[str] = Header(None)):
     """
     require_token(x_admin_token)
 
+    # reload tg_users if changed
+    try:
+        sync_targets_from_file(force=False)
+    except Exception:
+        pass
+
     con = db()
     peers = [r[0] for r in con.execute("SELECT peer FROM targets WHERE kind='group' ORDER BY id ASC").fetchall()]
     con.close()
@@ -487,7 +649,10 @@ async def groups_send_now(x_admin_token: Optional[str] = Header(None)):
     if not peers:
         return {"ok": True, "status": "no_group_targets"}
 
-    results = [await send_to_target("group", p) for p in peers]
+    results = []
+    for p in peers:
+        results.append(await send_to_target("group", p))
+
     return {"ok": True, "results": results}
 
 
@@ -497,13 +662,22 @@ async def group_scheduler_loop():
     """
     while True:
         try:
+            # reload tg_users if changed
+            try:
+                sync_targets_from_file(force=False)
+            except Exception:
+                pass
+
             con = db()
             peers = [r[0] for r in con.execute("SELECT peer FROM targets WHERE kind='group' ORDER BY id ASC").fetchall()]
             con.close()
 
-            for p in peers:
-                await send_to_target("group", p)
+            if peers:
+                for p in peers:
+                    await send_to_target("group", p)
+
         except Exception:
+            # do not crash loop
             pass
 
         await asyncio.sleep(max(60, GROUP_PERIOD_MINUTES * 60))
