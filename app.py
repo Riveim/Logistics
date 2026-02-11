@@ -897,6 +897,12 @@ class AppGUI:
                     "info": order[7],
                 }
 
+                if first:
+                    payload["__reset"] = True
+                    first = False
+
+                resp = self.http.post(f"{API_URL}/orders/create", json=payload, timeout=10)
+
                 try:
                     resp = self.http.post(f"{API_URL}/orders/create", json=payload, timeout=10)
                     if resp.status_code in (200, 201):
