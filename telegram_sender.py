@@ -20,7 +20,7 @@ TG_API_HASH = os.getenv("TG_API_HASH", "d94a6e7d6ccc9f931e93db1f3097b079")
 TG_SESSION_STRING = os.getenv("TG_SESSION_STRING", "tg_session2")
 
 SENDER_HOST = os.getenv("SENDER_HOST", "127.0.0.1")
-SENDER_PORT = int(os.getenv("SENDER_PORT", "5000"))
+SENDER_PORT = int(os.getenv("SENDER_PORT", "5001"))
 
 DB_PATH = os.getenv("DB_PATH", "/opt/telegram_sender/sender.db")
 
