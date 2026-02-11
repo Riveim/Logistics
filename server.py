@@ -46,14 +46,26 @@ def create_order(order: dict, authorization: str = Header(None)):
         raise HTTPException(status_code=401, detail="bad/expired token")
 
     # пересылаем заявку в telegram_app
+    # after order_id is created and committed
     try:
         requests.post(
-            TELEGRAM_APP_URL,
-            json=order,
-            timeout=3
+            "http://127.0.0.1:5001/send_order",
+            json={
+                "order_id": int(order_id),
+                "direction": direction,
+                "cargo": cargo,
+                "tonnage": float(tonnage),
+                "truck": truck,
+                "date": date,
+                "price": float(price),
+                "info": info_text,
+                "from_company": "",  # если хочешь
+            },
+            headers={"X-Telegram-Token": os.getenv("TELEGRAM_FORWARD_TOKEN", "CHANGE_ME_TG_TOKEN")},
+            timeout=5,
         )
     except Exception as e:
-        print("[SERVER] Telegram send error:", e)
+        print("[SERVER] telegram_app send error:", e)
 
     return {"status": "ok"}
 
