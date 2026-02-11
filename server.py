@@ -27,7 +27,7 @@ app = FastAPI()
 
 # === НАСТРОЙКИ ===
 SERVER_HOST = "0.0.0.0"
-SERVER_PORT = 5000
+SERVER_PORT = 5001
 
 TELEGRAM_APP_URL = "http://127.0.0.1:5001"  # <-- ИЗМЕНИ если нужно
 VALID_TOKEN = "SECRET_TOKEN"
