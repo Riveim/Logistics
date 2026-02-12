@@ -23,58 +23,44 @@ from fastapi import FastAPI, HTTPException, Header
 import requests
 import uvicorn
 
-app = FastAPI()
+forwarder_app = FastAPI()
 
 # === НАСТРОЙКИ ===
 SERVER_HOST = "0.0.0.0"
 SERVER_PORT = 5002
 
-TELEGRAM_APP_URL = "http://127.0.0.1:5001"  # <-- ИЗМЕНИ если нужно
+TELEGRAM_APP_URL = "http://127.0.0.1:5001/send_order"  # <-- ИЗМЕНИ если нужно
 VALID_TOKEN = "SECRET_TOKEN"
 
 
-@app.post("/login")
+@forwarder_app.post("/login")
 def login(data: dict):
     if data.get("username") == "admin" and data.get("password") == "admin":
         return {"token": VALID_TOKEN}
     raise HTTPException(status_code=401, detail="bad credentials")
 
 
-@app.post("/orders/create")
+@forwarder_app.post("/orders/create")
 def create_order(order: dict, authorization: str = Header(None)):
     if authorization != f"Bearer {VALID_TOKEN}":
         raise HTTPException(status_code=401, detail="bad/expired token")
 
     # пересылаем заявку в telegram_app
-    # after order_id is created and committed
     try:
         requests.post(
-            "http://127.0.0.1:5001/send_order",
-            json={
-                "order_id": int(order_id),
-                "direction": direction,
-                "cargo": cargo,
-                "tonnage": float(tonnage),
-                "truck": truck,
-                "date": date,
-                "price": float(price),
-                "info": info_text,
-                "from_company": "",  # если хочешь
-            },
-            headers={"X-Telegram-Token": os.getenv("TELEGRAM_FORWARD_TOKEN", "CHANGE_ME_TG_TOKEN")},
-            timeout=5,
+            TELEGRAM_APP_URL,
+            json=order,
+            timeout=3
         )
     except Exception as e:
-        print("[SERVER] telegram_app send error:", e)
+        print("[SERVER] Telegram send error:", e)
 
     return {"status": "ok"}
 
 
-if __name__ == "__main__":
-    uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT)
+def run_forwarder():
+    uvicorn.run(forwarder_app, host=SERVER_HOST, port=SERVER_PORT)
 
-
-# ================== CONFIG ==================
 # ===== EMAIL CONFIG =====
 SMTP_HOST = os.getenv("SMTP_HOST", "")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
@@ -1062,6 +1048,27 @@ if __name__ == "__main__":
     parser.add_argument("--set-key-company", nargs=2, metavar=("KEY", "COMPANY"),
                         help="Bind an existing key to a company. Example: --set-key-company KEY \"My LLC\"")
 
+    parser.add_argument(
+        "--delete-key",
+        default="",
+        help="Permanently delete a license key from DB (and its activations). Example: --delete-key ABCD-....",
+    )
+    # alias (на всякий случай)
+    parser.add_argument(
+        "--delete-key-forever",
+        dest="delete_key",
+        default="",
+        help="Alias for --delete-key",
+    )
+
+    # удобный алиас для привязки компании к существующему ключу
+    parser.add_argument(
+        "--bind-company",
+        nargs=2,
+        metavar=("KEY", "COMPANY"),
+        help='Alias for --set-key-company. Example: --bind-company KEY "My LLC"',
+    )
+
     # ===== Activations =====
     parser.add_argument("--list-activations", action="store_true",
                         help="List recent license activations (all keys). Use --key to filter.")
@@ -1177,6 +1184,56 @@ if __name__ == "__main__":
 
         print("UPDATED_LICENSE:", dict(updated))
 
+
+    def _delete_key_forever(key_raw: str):
+        key = format_license_key(normalize_license_key(key_raw))
+        if not key:
+            print("ERROR: empty key")
+            raise SystemExit(2)
+
+        conn = db_connect()
+        try:
+            cur = conn.cursor()
+
+            # exists?
+            cur.execute("SELECT license_key FROM license_keys WHERE license_key=?", (key,))
+            row = cur.fetchone()
+            if not row:
+                print("ERROR: license_not_found:", key)
+                raise SystemExit(2)
+
+            # revoke sessions for users registered with this key
+            try:
+                cur.execute("SELECT username FROM users WHERE license_key_used=?", (key,))
+                rows_u = cur.fetchall() or []
+                for r in rows_u:
+                    uname = r["username"] if isinstance(r, sqlite3.Row) else r[0]
+                    if uname:
+                        revoke_all_tokens_for(str(uname))
+            except Exception:
+                pass
+
+            # unlink key from users (so there are no dangling references)
+            try:
+                cur.execute("UPDATE users SET license_key_used=NULL WHERE license_key_used=?", (key,))
+            except Exception:
+                pass
+
+            # delete activations first
+            try:
+                cur.execute("DELETE FROM license_activations WHERE license_key=?", (key,))
+            except Exception:
+                pass
+
+            # delete the key itself
+            cur.execute("DELETE FROM license_keys WHERE license_key=?", (key,))
+
+            conn.commit()
+        finally:
+            conn.close()
+
+        print("DELETED_LICENSE:", key)
+
     def _list_keys(active_only: bool = False, limit: int = 200):
         limit = int(max(1, min(2000, limit)))
         conn = db_connect()
@@ -1248,6 +1305,14 @@ if __name__ == "__main__":
 
     if args.set_key_company:
         _set_key_company(args.set_key_company[0], args.set_key_company[1])
+        raise SystemExit(0)
+
+    if args.bind_company:
+        _set_key_company(args.bind_company[0], args.bind_company[1])
+        raise SystemExit(0)
+
+    if args.delete_key:
+        _delete_key_forever(args.delete_key)
         raise SystemExit(0)
 
     if args.keygen:
