@@ -83,6 +83,15 @@ REQUIRE_APP_IN_LOGIN = os.getenv("REQUIRE_APP_IN_LOGIN", "1") == "1"
 TOKEN_TTL_SECONDS = int(os.getenv("TOKEN_TTL_SECONDS", "86400"))
 SINGLE_SESSION_PER_USER = os.getenv("SINGLE_SESSION_PER_USER", "1") == "1"
 
+# === LICENSE ENFORCEMENT ===
+# If True, every authenticated API call will also verify that the user's license key is still valid.
+# This is required if you want CLI actions like --delete-key to immediately block access for already logged-in users.
+ENFORCE_LICENSE_ON_EACH_REQUEST = os.getenv("ENFORCE_LICENSE_ON_EACH_REQUEST", "1") == "1"
+
+# If True, any non-admin user MUST have a license_key_used set. If it's empty/NULL -> API returns 403 license_required.
+REQUIRE_LICENSE_FOR_NON_ADMIN = os.getenv("REQUIRE_LICENSE_FOR_NON_ADMIN", "1") == "1"
+
+
 TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "0") == "1"
 
 ALLOWED_ROLES = {"manager", "transport", "admin"}
@@ -522,9 +531,43 @@ def require_auth():
     if not meta:
         return None, jsonify({"error": "bad/expired token"}), 401
 
-    # License validity is checked only during /login and /register.
-    # We do NOT enforce license status on every API call here, so an already logged-in session
-    # won't be interrupted mid-work.
+    # IMPORTANT:
+    # Previously license validity was checked only during /login and /register.
+    # That allows an already logged-in session to keep working even after the license key is deleted/inactivated via CLI.
+    # If you want actions like --delete-key to immediately block access, enable enforcement on each request.
+    if ENFORCE_LICENSE_ON_EACH_REQUEST:
+        username = (meta.get("username") or "").strip()
+        if not username:
+            return None, jsonify({"error": "bad/expired token"}), 401
+
+        conn = db_connect()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT username, role, device_id, license_key_used FROM users WHERE username=?", (username,))
+            user = cur.fetchone()
+            if not user:
+                revoke_all_tokens_for(username)
+                return None, jsonify({"error": "bad/expired token"}), 401
+
+            role = (user["role"] or "").strip().lower()
+            lk = (user["license_key_used"] or "").strip()
+
+            if role != "admin":
+                if REQUIRE_LICENSE_FOR_NON_ADMIN and not lk:
+                    revoke_all_tokens_for(username)
+                    return None, jsonify({"error": "license_required", "license_valid": False}), 403
+
+                if lk:
+                    app_name = (meta.get("app") or "manager").strip().lower() or "manager"
+                    dev_for_license = (user["device_id"] or "").strip() or "0"
+                    ok_lk, reason_lk, meta_lk = validate_license_and_touch(conn, lk, app_name, dev_for_license)
+                    if not ok_lk:
+                        conn.rollback()
+                        revoke_all_tokens_for(username)
+                        return None, jsonify({"error": reason_lk, "license_valid": False, **meta_lk}), 403
+                    conn.commit()
+        finally:
+            conn.close()
 
     return meta, None, None
 
@@ -1212,12 +1255,11 @@ if __name__ == "__main__":
                         revoke_all_tokens_for(str(uname))
             except Exception:
                 pass
+            # NOTE:
+            # We intentionally do NOT set users.license_key_used to NULL here.
+            # Keeping the reference makes the user immediately fail license checks after deletion.
+            # (There is no FK constraint, so this is safe.)
 
-            # unlink key from users (so there are no dangling references)
-            try:
-                cur.execute("UPDATE users SET license_key_used=NULL WHERE license_key_used=?", (key,))
-            except Exception:
-                pass
 
             # delete activations first
             try:
