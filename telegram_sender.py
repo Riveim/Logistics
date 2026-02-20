@@ -1,4 +1,4 @@
-# telegram_sender.py
+﻿# telegram_sender.py
 # -*- coding: utf-8 -*-
 
 import os
@@ -448,15 +448,19 @@ async def send_to_target(kind: str, peer: str) -> Dict[str, Any]:
         for m in messages:
             await rate_limit_ok()
             try:
-                await client.send_message(peer, m)
+                msg = await client.send_message(peer, m)
+                print(f"[OK] sent to {peer}, msg_id={msg.id}")
             except FloodWaitError as e:
+                print(f"[FLOOD] {peer}, sleep {e.seconds}s")
                 await asyncio.sleep(e.seconds + 2)
-                await rate_limit_ok()
-                await client.send_message(peer, m)
+                msg = await client.send_message(peer, m)
+                print(f"[OK after flood] {peer}, msg_id={msg.id}")
             except RPCError as e:
-                return {"peer": peer, "sent": 0, "last_id": last_id, "status": "failed", "error": str(e)}
+                print(f"[RPC ERROR] {peer}: {e}")
+                return {"peer": peer, "sent": 0, "status": "failed", "error": str(e)}
             except Exception as e:
-                return {"peer": peer, "sent": 0, "last_id": last_id, "status": "failed", "error": repr(e)}
+                print(f"[UNKNOWN ERROR] {peer}: {repr(e)}")
+                return {"peer": peer, "sent": 0, "status": "failed", "error": repr(e)}
 
         set_cursor(con, kind, peer, max_sent_id)
         return {"peer": peer, "sent": len(orders), "last_id": max_sent_id, "status": "ok"}
