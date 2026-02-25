@@ -1,4 +1,4 @@
-# manager_app.py
+﻿# manager_app.py
 # -*- coding: utf-8 -*-
 
 import os
@@ -42,11 +42,20 @@ class AutoScrollbar(ttk.Scrollbar):
         raise tk.TclError("Use grid() with AutoScrollbar")
 
 # ===== Login UI assets (put your file paths here) =====
-LOGIN_ICON_PATH = r"Theresa.ico"             # <-- сюда путь к .ico (Windows)
+LOGIN_ICON_PATH = r"icon.ico"             # <-- сюда путь к .ico (Windows)
 LOGIN_BG_PATH = r"login_background.png"      # <-- сюда путь к .png/.gif (ВАЖНО: PhotoImage НЕ читает .jpg без PIL)
 
-API_URL = os.getenv("API_URL", "http://34.179.169.197")
+API_URL = os.getenv("API_URL", "http://34.179.169.197:5002")
 HTTP_TIMEOUT = 6
+
+# Token file (persist across sessions regardless of current working directory)
+def app_base_dir() -> str:
+    """Папка запуска: рядом с .exe (PyInstaller) или рядом со скриптом."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+TOKEN_FILE = os.path.join(app_base_dir(), "manager_auth_token.txt")
 
 # ================== THEME ==================
 BG_MAIN = "#1e1e1e"
@@ -884,6 +893,7 @@ class AppGUI:
 
         info(self.root, "Публикация", "Заявки загружены. Пожалуйста, ожидайте откликов.")
 
+        first = True
         for item, order in list(self.id_map.items()):
             order_id = order[0]
             if order_id is None or int(order_id) < 0:
@@ -896,12 +906,6 @@ class AppGUI:
                     "price": order[6],
                     "info": order[7],
                 }
-
-                if first:
-                    payload["__reset"] = True
-                    first = False
-
-                resp = self.http.post(f"{API_URL}/orders/create", json=payload, timeout=10)
 
                 try:
                     resp = self.http.post(f"{API_URL}/orders/create", json=payload, timeout=10)
@@ -1276,7 +1280,7 @@ def login_to_server(root: tk.Tk) -> Optional[str]:
 
             if remember.get():
                 try:
-                    with open("manager_auth_token.txt", "w", encoding="utf-8") as f:
+                    with open(TOKEN_FILE, "w", encoding="utf-8") as f:
                         f.write(token)
                 except Exception:
                     pass
@@ -1321,6 +1325,7 @@ def login_to_server(root: tk.Tk) -> Optional[str]:
         email_e = labeled(panel2, "Почта (email)")
         company_e = labeled(panel2, "Название компании")
         key_e = labeled(panel2, "Ключ продукта")
+        key2_e = labeled(panel2, "Подтверждение ключа")
 
         def do_register_real():
             u = u_e.get().strip()
@@ -1329,9 +1334,14 @@ def login_to_server(root: tk.Tk) -> Optional[str]:
             email = email_e.get().strip()
             company_name = company_e.get().strip()
             key = key_e.get().strip()
+            key2 = key2_e.get().strip()
 
-            if not u or not p or not phone or not email or not company_name or not key:
+            if not u or not p or not phone or not email or not company_name or not key or not key2:
                 error(reg, "Ошибка", "Заполните все поля")
+                return
+
+            if key != key2:
+                error(reg, "Ошибка", "Ключ и подтверждение не совпадают")
                 return
 
             try:
@@ -1344,6 +1354,7 @@ def login_to_server(root: tk.Tk) -> Optional[str]:
                         "phone": phone,
                         "company_name": company_name,
                         "license_key": key,
+                        "license_key_confirm": key2,
                         "device_id": get_device_id(),
                         "role": "manager",
                     },
@@ -1393,7 +1404,7 @@ def login_to_server(root: tk.Tk) -> Optional[str]:
 
 
 def try_restore_token() -> Optional[str]:
-    p = "manager_auth_token.txt"
+    p = TOKEN_FILE
     if not os.path.exists(p):
         return None
 
