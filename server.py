@@ -73,7 +73,7 @@ SMTP_TLS = os.getenv("SMTP_TLS", "1") == "1"
 MUSIC_DIR = r"music"
 MUSIC_DEFAULT_FILE = ""
 
-DB_PATH = os.getenv("DB_PATH", "mvp_server.db")
+DB_PATH = os.getenv("DB_PATH") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "mvp_server.db")
 ADMIN_SETUP_KEY = os.getenv("ADMIN_SETUP_KEY", "CHANGE_ME_SETUP_KEY")
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "5000"))
@@ -82,6 +82,9 @@ REQUIRE_DEVICE_ID = os.getenv("REQUIRE_DEVICE_ID", "1") == "1"
 REQUIRE_APP_IN_LOGIN = os.getenv("REQUIRE_APP_IN_LOGIN", "1") == "1"
 TOKEN_TTL_SECONDS = int(os.getenv("TOKEN_TTL_SECONDS", "86400"))
 SINGLE_SESSION_PER_USER = os.getenv("SINGLE_SESSION_PER_USER", "1") == "1"
+
+# Active device window for "concurrent/active device" enforcement (seconds)
+ACTIVE_DEVICE_WINDOW_SECONDS = int(os.getenv("ACTIVE_DEVICE_WINDOW_SECONDS", "86400"))
 
 # === LICENSE ENFORCEMENT ===
 # If True, every authenticated API call will also verify that the user's license key is still valid.
@@ -263,6 +266,8 @@ def ensure_license_tables():
       license_key TEXT PRIMARY KEY,
       app TEXT NOT NULL,                 -- manager/transport/any
       max_devices INTEGER NOT NULL DEFAULT 1,
+      max_users INTEGER NOT NULL DEFAULT 1,
+      max_active_devices INTEGER NOT NULL DEFAULT 0,   -- 0 = do not enforce separate 'active' limit
       expires_at INTEGER DEFAULT NULL,   -- unix ts, NULL = бессрочно
       active INTEGER NOT NULL DEFAULT 1,
       company TEXT DEFAULT '',
@@ -281,13 +286,16 @@ def ensure_license_tables():
       UNIQUE(license_key, app, device_id)
     )
     """)
-
-    # ---- migration: add company column if DB is old ----
+    # ---- migration: add new columns if DB is old ----
     try:
         cur.execute("PRAGMA table_info(license_keys)")
         cols = {row["name"] for row in cur.fetchall()}
         if "company" not in cols:
             cur.execute("ALTER TABLE license_keys ADD COLUMN company TEXT DEFAULT ''")
+        if "max_users" not in cols:
+            cur.execute("ALTER TABLE license_keys ADD COLUMN max_users INTEGER NOT NULL DEFAULT 1")
+        if "max_active_devices" not in cols:
+            cur.execute("ALTER TABLE license_keys ADD COLUMN max_active_devices INTEGER NOT NULL DEFAULT 0")
     except Exception:
         pass
 
@@ -344,7 +352,7 @@ def validate_license_and_touch(conn: sqlite3.Connection, license_key: str, app_n
             "INSERT INTO license_activations (license_key, app, device_id, activated_at, last_seen) VALUES (?, ?, ?, ?, ?)",
             (license_key_fmt, app_name, device_id, ts, ts),
         )
-    return True, "ok", {"license_key": license_key_fmt, "expires_at": expires_at, "max_devices": max_devices}
+    return True, "ok", {"license_key": license_key_fmt, "expires_at": expires_at, "max_devices": max_devices, "max_users": max_users, "max_active_devices": max_active_devices}
 
 
 def verify_password(password: str, password_hash: str) -> bool:
@@ -374,6 +382,18 @@ def db_init():
       device_id TEXT DEFAULT NULL,
       license_key_used TEXT DEFAULT NULL,
       created_at INTEGER NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS sessions (
+      token TEXT PRIMARY KEY,
+      username TEXT NOT NULL,
+      role TEXT NOT NULL,
+      app TEXT NOT NULL,
+      issued_at INTEGER NOT NULL,
+      last_seen INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL
     )
     """)
 
@@ -452,6 +472,8 @@ def db_migrate_users():
         cur.execute("ALTER TABLE users ADD COLUMN device_id TEXT DEFAULT NULL")
     if "license_key_used" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN license_key_used TEXT DEFAULT NULL")
+    if "active" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
 
     conn.commit()
     conn.close()
@@ -495,6 +517,95 @@ def revoke_all_tokens_for(username: str):
         to_del = [t for t, v in TOKENS.items() if v.get("username") == username]
         for t in to_del:
             TOKENS.pop(t, None)
+    _session_delete_for_user(username)
+
+
+
+
+def _session_store(token: str, meta: Dict[str, Any]) -> None:
+    """Persist session token so it survives server restarts."""
+    try:
+        conn = db_connect()
+        cur = conn.cursor()
+        issued_at = int(meta.get("issued_at", now_ts()))
+        last_seen = int(meta.get("last_seen", issued_at))
+        expires_at = issued_at + int(TOKEN_TTL_SECONDS)
+        cur.execute(
+            "INSERT OR REPLACE INTO sessions (token, username, role, app, issued_at, last_seen, expires_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (token, meta.get("username"), meta.get("role"), meta.get("app"), issued_at, last_seen, expires_at),
+        )
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _session_load(token: str) -> Optional[Dict[str, Any]]:
+    """Load session token from DB. Returns meta or None."""
+    try:
+        conn = db_connect()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM sessions WHERE token=?", (token,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        row = dict(row)
+        if now_ts() > int(row.get("expires_at", 0)):
+            try:
+                cur.execute("DELETE FROM sessions WHERE token=?", (token,))
+                conn.commit()
+            except Exception:
+                pass
+            return None
+        return {
+            "username": row.get("username"),
+            "role": row.get("role"),
+            "app": row.get("app"),
+            "issued_at": int(row.get("issued_at", 0)),
+            "last_seen": int(row.get("last_seen", 0)),
+        }
+    except Exception:
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _session_touch(token: str, last_seen: int) -> None:
+    try:
+        conn = db_connect()
+        cur = conn.cursor()
+        cur.execute("UPDATE sessions SET last_seen=? WHERE token=?", (int(last_seen), token))
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _session_delete_for_user(username: str) -> None:
+    try:
+        conn = db_connect()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM sessions WHERE username=?", (username,))
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def issue_token(username: str, role: str, app_name: str) -> str:
@@ -507,19 +618,40 @@ def issue_token(username: str, role: str, app_name: str) -> str:
             "issued_at": now_ts(),
             "last_seen": now_ts(),
         }
+    _session_store(token, TOKENS[token])
     return token
 
 
 def validate_token(token: str) -> Optional[Dict[str, Any]]:
+    # 1) fast path: in-memory
     with data_lock:
         meta = TOKENS.get(token)
-        if not meta:
-            return None
-        if now_ts() - int(meta.get("issued_at", 0)) > TOKEN_TTL_SECONDS:
-            TOKENS.pop(token, None)
-            return None
-        meta["last_seen"] = now_ts()
-        return meta
+        if meta:
+            if now_ts() - int(meta.get("issued_at", 0)) > TOKEN_TTL_SECONDS:
+                TOKENS.pop(token, None)
+                # best-effort cleanup DB
+                try:
+                    conn = db_connect()
+                    conn.cursor().execute("DELETE FROM sessions WHERE token=?", (token,))
+                    conn.commit()
+                    conn.close()
+                except Exception:
+                    pass
+                return None
+            meta["last_seen"] = now_ts()
+            _session_touch(token, meta["last_seen"])
+            return meta
+
+    # 2) fallback: persistent sessions
+    meta_db = _session_load(token)
+    if not meta_db:
+        return None
+
+    meta_db["last_seen"] = now_ts()
+    _session_touch(token, meta_db["last_seen"])
+    with data_lock:
+        TOKENS[token] = meta_db
+    return meta_db
 
 
 
@@ -530,6 +662,26 @@ def require_auth():
     meta = validate_token(token)
     if not meta:
         return None, jsonify({"error": "bad/expired token"}), 401
+
+
+    # Check account state (deactivated accounts must not access API)
+    try:
+        conn = db_connect()
+        cur = conn.cursor()
+        cur.execute("SELECT active FROM users WHERE username=?", ((meta.get("username") or "").strip(),))
+        row = cur.fetchone()
+        active_val = None
+        if row is not None:
+            active_val = row["active"] if isinstance(row, sqlite3.Row) else row[0]
+        if row is None or int(active_val or 0) != 1:
+            return None, jsonify({"error": "account_inactive"}), 403
+    except Exception:
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     # IMPORTANT:
     # Previously license validity was checked only during /login and /register.
@@ -595,6 +747,7 @@ def require_role(required_role: str):
 def license_activate():
     data = request.get_json(force=True)
     license_key = (data.get("license_key") or "").strip()
+    license_key_confirm = (data.get("license_key_confirm") or "").strip()
     device_id = (data.get("device_id") or "").strip()
     app_name = (data.get("app") or "").strip().lower()
 
@@ -614,6 +767,7 @@ def license_activate():
 def license_status():
     data = request.get_json(force=True)
     license_key = (data.get("license_key") or "").strip()
+    license_key_confirm = (data.get("license_key_confirm") or "").strip()
     device_id = (data.get("device_id") or "").strip()
     app_name = (data.get("app") or "").strip().lower()
 
@@ -635,6 +789,8 @@ def admin_license_create():
     data = request.get_json(force=True)
     app_name = (data.get("app") or "any").strip().lower()
     max_devices = int(data.get("max_devices") or 1)
+    max_users = int(data.get("max_users") or 1)
+    max_active_devices = int(data.get("max_active_devices") or 0)
     days = data.get("days")
     length = int(data.get("length") or 20)
     note = str(data.get("note") or "")
@@ -643,6 +799,10 @@ def admin_license_create():
         return jsonify({"error": "bad_app", "allowed": ["any", "manager", "transport"]}), 400
     if max_devices < 1:
         return jsonify({"error": "bad_max_devices"}), 400
+    if max_users < 1:
+        return jsonify({"error": "bad_max_users"}), 400
+    if max_active_devices < 0:
+        return jsonify({"error": "bad_max_active_devices"}), 400
 
     expires_at = None
     if days is not None and str(days).strip() != "":
@@ -659,11 +819,12 @@ def admin_license_create():
     try:
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO license_keys (license_key, app, max_devices, expires_at, active, note, created_at) VALUES (?, ?, ?, ?, 1, ?, ?)",
-            (key, app_name, max_devices, expires_at, note, now_ts()),
+            "INSERT INTO license_keys (license_key, app, max_devices, max_users, max_active_devices, expires_at, active, note, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
+            (key, app_name, max_devices, max_users, max_active_devices, expires_at, note, now_ts()),
         )
         conn.commit()
-        return jsonify({"status": "ok", "license_key": key, "app": app_name, "max_devices": max_devices, "expires_at": expires_at}), 201
+        return jsonify({"status": "ok", "license_key": key, "app": app_name, "max_devices": max_devices, "max_users": max_users, "max_active_devices": max_active_devices, "expires_at": expires_at}), 201
     finally:
         conn.close()
 
@@ -682,6 +843,22 @@ def admin_license_update(license_key: str):
             return jsonify({"error": "bad_max_devices"}), 400
         if fields["max_devices"] < 1:
             return jsonify({"error": "bad_max_devices"}), 400
+
+    if "max_users" in data:
+        try:
+            fields["max_users"] = int(data.get("max_users"))
+        except Exception:
+            return jsonify({"error": "bad_max_users"}), 400
+        if fields["max_users"] < 1:
+            return jsonify({"error": "bad_max_users"}), 400
+
+    if "max_active_devices" in data:
+        try:
+            fields["max_active_devices"] = int(data.get("max_active_devices"))
+        except Exception:
+            return jsonify({"error": "bad_max_active_devices"}), 400
+        if fields["max_active_devices"] < 0:
+            return jsonify({"error": "bad_max_active_devices"}), 400
 
     if "expires_at" in data:
         exp = data.get("expires_at")
@@ -725,7 +902,7 @@ def admin_license_list():
     conn = db_connect()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT license_key, app, max_devices, expires_at, active, note, created_at FROM license_keys ORDER BY created_at DESC LIMIT 500")
+        cur.execute("SELECT license_key, app, max_devices, max_users, max_active_devices, expires_at, active, note, created_at FROM license_keys ORDER BY created_at DESC LIMIT 500")
         rows = [dict(r) for r in cur.fetchall()]
         return jsonify({"status": "ok", "items": rows}), 200
     finally:
@@ -747,6 +924,7 @@ def register():
     device_id = (data.get("device_id") or "").strip()
     invite_code = (data.get("invite_code") or "").strip()
     license_key = (data.get("license_key") or "").strip()
+    license_key_confirm = (data.get("license_key_confirm") or "").strip()
 
     if role not in ("manager", "transport"):
         return jsonify({"error": "bad_role", "allowed": ["manager", "transport"]}), 400
@@ -772,6 +950,13 @@ def register():
                 conn.rollback()
                 return jsonify({"error": reason}), 403
         else:
+            if not license_key_confirm:
+                conn.rollback()
+                return jsonify({"error": "license_key_confirm_required"}), 400
+            if normalize_license_key(license_key) != normalize_license_key(license_key_confirm):
+                conn.rollback()
+                return jsonify({"error": "license_key_confirm_mismatch"}), 400
+
             if REQUIRE_DEVICE_ID and not device_id:
                 conn.rollback()
                 return jsonify({"error": "device_id_required"}), 400
@@ -779,6 +964,16 @@ def register():
             if not ok2:
                 conn.rollback()
                 return jsonify({"error": reason2, "license_valid": False, **meta}), 403
+
+            # strict control: how many USERS can be created under this key
+            lk_fmt = (meta.get("license_key") or "").strip()
+            if lk_fmt:
+                cur.execute("SELECT COUNT(*) AS c FROM users WHERE license_key_used=?", (lk_fmt,))
+                used_users = int(cur.fetchone()["c"] or 0)
+                max_users = int(meta.get("max_users") or 1)
+                if used_users >= max_users:
+                    conn.rollback()
+                    return jsonify({"error": "user_limit_reached", "max_users": max_users, "used_users": used_users, "license_key": lk_fmt}), 403
 
 
         cur.execute(
@@ -934,6 +1129,12 @@ def list_my_orders():
         conn.close()
 
 
+@app.get("/orders/list")
+def list_orders_alias():
+    # Backward-compatible alias used by some clients
+    return list_my_orders()
+
+
 @app.post("/orders/close")
 def close_orders():
     meta, err, code = require_auth()
@@ -1079,6 +1280,8 @@ if __name__ == "__main__":
     parser.add_argument("--keygen", action="store_true", help="Generate and store a new license key in DB, then exit")
     parser.add_argument("--app", default="any", choices=["any", "manager", "transport"], help="License app scope")
     parser.add_argument("--max-devices", type=int, default=1, help="Max devices for generated key")
+    parser.add_argument("--max-users", type=int, default=1, help="Max users that can register under this key")
+    parser.add_argument("--max-active-devices", type=int, default=0, help="Max ACTIVE devices (0 = ignore). Active = last_seen within ACTIVE_DEVICE_WINDOW_SECONDS")
     parser.add_argument("--days", type=int, default=0, help="Days until expiration (0 = бессрочно)")
     parser.add_argument("--length", type=int, default=20, help="Key length (12..32)")
     parser.add_argument("--company", default="", help="Bind key to company (optional)")
@@ -1119,6 +1322,9 @@ if __name__ == "__main__":
     parser.add_argument("--activations-limit", type=int, default=200, help="Limit for --list-activations (default 200)")
 
     # ===== Users / roles (read-only) =====
+    parser.add_argument("--delete-user", default="", help="Delete a user account and ALL related data. Requires --confirm DELETE:<username>")
+    parser.add_argument("--confirm", default="", help="Confirmation string for dangerous actions")
+
     parser.add_argument("--users-count", action="store_true", help="Print total users + per-role counts and exit")
     parser.add_argument("--list-users", action="store_true", help="List last N users with roles and exit")
     parser.add_argument("--users-limit", type=int, default=200, help="Limit for --list-users (default 200)")
@@ -1194,7 +1400,7 @@ if __name__ == "__main__":
                 except Exception:
                     pass
 
-            cur.execute("SELECT license_key, active, app, max_devices, expires_at, company, note, created_at FROM license_keys WHERE license_key=?", (key,))
+            cur.execute("SELECT license_key, active, app, max_devices, max_users, max_active_devices, expires_at, company, note, created_at FROM license_keys WHERE license_key=?", (key,))
             updated = cur.fetchone()
         finally:
             conn.close()
@@ -1220,7 +1426,7 @@ if __name__ == "__main__":
             cur.execute("UPDATE license_keys SET company=? WHERE license_key=?", ((company or "").strip(), key))
             conn.commit()
 
-            cur.execute("SELECT license_key, active, app, max_devices, expires_at, company, note, created_at FROM license_keys WHERE license_key=?", (key,))
+            cur.execute("SELECT license_key, active, app, max_devices, max_users, max_active_devices, expires_at, company, note, created_at FROM license_keys WHERE license_key=?", (key,))
             updated = cur.fetchone()
         finally:
             conn.close()
@@ -1255,7 +1461,13 @@ if __name__ == "__main__":
                         revoke_all_tokens_for(str(uname))
             except Exception:
                 pass
-            # NOTE:
+            
+            # deactivate ALL accounts registered with this key (accounts, not devices)
+            try:
+                cur.execute("UPDATE users SET active=0 WHERE license_key_used=?", (key,))
+            except Exception:
+                pass
+# NOTE:
             # We intentionally do NOT set users.license_key_used to NULL here.
             # Keeping the reference makes the user immediately fail license checks after deletion.
             # (There is no FK constraint, so this is safe.)
@@ -1283,13 +1495,13 @@ if __name__ == "__main__":
             cur = conn.cursor()
             if active_only:
                 cur.execute(
-                    "SELECT license_key, app, max_devices, expires_at, active, company, note, created_at "
+                    "SELECT license_key, app, max_devices, max_users, max_active_devices, expires_at, active, company, note, created_at "
                     "FROM license_keys WHERE active=1 ORDER BY created_at DESC LIMIT ?",
                     (limit,),
                 )
             else:
                 cur.execute(
-                    "SELECT license_key, app, max_devices, expires_at, active, company, note, created_at "
+                    "SELECT license_key, app, max_devices, max_users, max_active_devices, expires_at, active, company, note, created_at "
                     "FROM license_keys ORDER BY created_at DESC LIMIT ?",
                     (limit,),
                 )
@@ -1337,6 +1549,63 @@ if __name__ == "__main__":
         _print_users_list(args.users_limit)
         raise SystemExit(0)
 
+    def _delete_user_forever(username_raw: str):
+        username = normalize_username(username_raw)
+        if not username:
+            print("ERROR: empty username")
+            raise SystemExit(2)
+        # strict confirmation
+        need = f"DELETE:{username}"
+        if (args.confirm or "").strip() != need:
+            print("ERROR: confirmation_required")
+            print("HINT: run with --confirm", need)
+            raise SystemExit(2)
+
+        conn = db_connect()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT username, role, device_id, license_key_used FROM users WHERE username=?", (username,))
+            u = cur.fetchone()
+            if not u:
+                print("ERROR: user_not_found:", username)
+                raise SystemExit(2)
+
+            device_id = (u["device_id"] or "").strip()
+            lk = (u["license_key_used"] or "").strip()
+
+            # delete offers created by this transport user
+            cur.execute("DELETE FROM market_offers WHERE transport_username=?", (username,))
+
+            # delete orders created by this user + related market rows
+            cur.execute("SELECT id FROM orders WHERE username=?", (username,))
+            order_ids = [int(r["id"]) for r in cur.fetchall()]
+            if order_ids:
+                q_marks = ",".join(["?"] * len(order_ids))
+                cur.execute(f"DELETE FROM market_offers WHERE order_id IN ({q_marks})", order_ids)
+                cur.execute(f"DELETE FROM market_orders WHERE order_id IN ({q_marks})", order_ids)
+                cur.execute(f"DELETE FROM orders WHERE id IN ({q_marks})", order_ids)
+
+            # delete license activations for this device/key (best-effort)
+            if lk and device_id:
+                try:
+                    cur.execute("DELETE FROM license_activations WHERE license_key=? AND device_id=?", (lk, device_id))
+                except Exception:
+                    pass
+
+            # finally, delete the user
+            cur.execute("DELETE FROM users WHERE username=?", (username,))
+
+            conn.commit()
+        finally:
+            conn.close()
+
+        revoke_all_tokens_for(username)
+        print("DELETED_USER:", username)
+
+    if args.delete_user:
+        _delete_user_forever(args.delete_user)
+        raise SystemExit(0)
+
     if args.disable_key:
         _set_license_active(args.disable_key, 0)
         raise SystemExit(0)
@@ -1354,7 +1623,12 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     if args.delete_key:
-        _delete_key_forever(args.delete_key)
+        key_norm = format_license_key(normalize_license_key(args.delete_key))
+        expected = f"DELETEKEY:{key_norm}"
+        if (args.confirm or "").strip() != expected:
+            print("ERROR: confirmation required. Use --confirm " + expected)
+            raise SystemExit(2)
+        _delete_key_forever(key_norm)
         raise SystemExit(0)
 
     if args.keygen:
@@ -1367,12 +1641,14 @@ if __name__ == "__main__":
         try:
             cur = conn.cursor()
             cur.execute(
-                "INSERT INTO license_keys (license_key, app, max_devices, expires_at, active, company, note, created_at) "
-                "VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
+                "INSERT INTO license_keys (license_key, app, max_devices, max_users, max_active_devices, expires_at, active, company, note, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
                 (
                     key,
                     args.app,
                     int(max(1, args.max_devices)),
+                    int(max(1, args.max_users)),
+                    int(max(0, args.max_active_devices)),
                     expires_at,
                     (args.company or "").strip(),
                     (args.note or "").strip(),
@@ -1386,6 +1662,8 @@ if __name__ == "__main__":
         print("LICENSE_KEY:", key)
         print("APP:", args.app)
         print("MAX_DEVICES:", int(max(1, args.max_devices)))
+        print("MAX_USERS:", int(max(1, args.max_users)))
+        print("MAX_ACTIVE_DEVICES:", int(max(0, args.max_active_devices)))
         print("ACTIVE:", 1)
         print("COMPANY:", (args.company or "").strip())
         print("NOTE:", (args.note or "").strip())
@@ -1406,6 +1684,6 @@ if __name__ == "__main__":
 
     # default: run server
     if args.run or (not args.keygen and not args.list_keys and not args.list_active_keys and not args.list_users and not args.users_count
-                    and not args.disable_key and not args.enable_key and not args.set_key_company and not args.list_activations):
+                    and not args.disable_key and not args.enable_key and not args.set_key_company and not args.list_activations and not args.delete_user):
         print(f"[SERVER] TELEGRAM_ENABLED env: {TELEGRAM_ENABLED}")
         app.run(host=HOST, port=PORT, debug=False)
