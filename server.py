@@ -333,6 +333,8 @@ def validate_license_and_touch(conn: sqlite3.Connection, license_key: str, app_n
         return False, "license_expired", {"expires_at": int(expires_at)}
 
     max_devices = int(row["max_devices"] or 1)
+    max_users = int(row["max_users"] or 1)
+    max_active_devices = int(row["max_active_devices"] or 0)
 
     # считаем активированные устройства
     cur.execute("SELECT COUNT(DISTINCT device_id) AS c FROM license_activations WHERE license_key=? AND app=?", (license_key_fmt, app_name))
