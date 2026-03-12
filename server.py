@@ -1,4 +1,4 @@
-# server.py
+﻿# server.py
 # -*- coding: utf-8 -*-
 import os
 import time
@@ -16,7 +16,7 @@ from typing import Optional, Dict, Any, Tuple
 from flask import Flask, request, jsonify, send_file, abort, send_from_directory
 
 # server.py
-# Принимает заявки от manager_app и ПЕРЕСЫЛАЕТ их в telegram_app
+# РџСЂРёРЅРёРјР°РµС‚ Р·Р°СЏРІРєРё РѕС‚ manager_app Рё РџР•Р Р•РЎР«Р›РђР•Рў РёС… РІ telegram_app
 # pip install fastapi uvicorn requests
 
 from fastapi import FastAPI, HTTPException, Header
@@ -25,11 +25,11 @@ import uvicorn
 
 forwarder_app = FastAPI()
 
-# === НАСТРОЙКИ ===
+# === РќРђРЎРўР РћР™РљР ===
 SERVER_HOST = "0.0.0.0"
-SERVER_PORT = 5000
+SERVER_PORT = 5002
 
-TELEGRAM_APP_URL = "http://127.0.0.1:5001"  # <-- ИЗМЕНИ если нужно
+TELEGRAM_APP_URL = "http://127.0.0.1:5001"  # <-- РР—РњР•РќР РµСЃР»Рё РЅСѓР¶РЅРѕ
 VALID_TOKEN = "SECRET_TOKEN"
 
 
@@ -45,7 +45,7 @@ def create_order(order: dict, authorization: str = Header(None)):
     if authorization != f"Bearer {VALID_TOKEN}":
         raise HTTPException(status_code=401, detail="bad/expired token")
 
-    # пересылаем заявку в telegram_app
+    # РїРµСЂРµСЃС‹Р»Р°РµРј Р·Р°СЏРІРєСѓ РІ telegram_app
     try:
         requests.post(
             TELEGRAM_APP_URL,
@@ -77,6 +77,7 @@ DB_PATH = os.getenv("DB_PATH") or os.path.join(os.path.dirname(os.path.abspath(_
 ADMIN_SETUP_KEY = os.getenv("ADMIN_SETUP_KEY", "CHANGE_ME_SETUP_KEY")
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "5000"))
+MARKET_MY_OFFERS_MAX_HOURS = 24 * 30
 
 REQUIRE_DEVICE_ID = os.getenv("REQUIRE_DEVICE_ID", "1") == "1"
 REQUIRE_APP_IN_LOGIN = os.getenv("REQUIRE_APP_IN_LOGIN", "1") == "1"
@@ -229,8 +230,8 @@ def validate_and_consume_invite_code(conn: sqlite3.Connection, code: str, role: 
 
 
 # ================== LICENSE (PRODUCT KEYS) ==================
-# Лицензионный ключ: хранится на сервере, активируется на конкретное устройство (device_id).
-# Можно менять лимит устройств и срок действия через админ-эндпоинты или CLI (см. main).
+# Р›РёС†РµРЅР·РёРѕРЅРЅС‹Р№ РєР»СЋС‡: С…СЂР°РЅРёС‚СЃСЏ РЅР° СЃРµСЂРІРµСЂРµ, Р°РєС‚РёРІРёСЂСѓРµС‚СЃСЏ РЅР° РєРѕРЅРєСЂРµС‚РЅРѕРµ СѓСЃС‚СЂРѕР№СЃС‚РІРѕ (device_id).
+# РњРѕР¶РЅРѕ РјРµРЅСЏС‚СЊ Р»РёРјРёС‚ СѓСЃС‚СЂРѕР№СЃС‚РІ Рё СЃСЂРѕРє РґРµР№СЃС‚РІРёСЏ С‡РµСЂРµР· Р°РґРјРёРЅ-СЌРЅРґРїРѕРёРЅС‚С‹ РёР»Рё CLI (СЃРј. main).
 
 LICENSE_KEY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 LICENSE_KEY_GROUP = 4
@@ -268,7 +269,7 @@ def ensure_license_tables():
       max_devices INTEGER NOT NULL DEFAULT 1,
       max_users INTEGER NOT NULL DEFAULT 1,
       max_active_devices INTEGER NOT NULL DEFAULT 0,   -- 0 = do not enforce separate 'active' limit
-      expires_at INTEGER DEFAULT NULL,   -- unix ts, NULL = бессрочно
+      expires_at INTEGER DEFAULT NULL,   -- unix ts, NULL = Р±РµСЃСЃСЂРѕС‡РЅРѕ
       active INTEGER NOT NULL DEFAULT 1,
       company TEXT DEFAULT '',
       note TEXT DEFAULT '',
@@ -336,7 +337,7 @@ def validate_license_and_touch(conn: sqlite3.Connection, license_key: str, app_n
     max_users = int(row["max_users"] or 1)
     max_active_devices = int(row["max_active_devices"] or 0)
 
-    # считаем активированные устройства
+    # СЃС‡РёС‚Р°РµРј Р°РєС‚РёРІРёСЂРѕРІР°РЅРЅС‹Рµ СѓСЃС‚СЂРѕР№СЃС‚РІР°
     cur.execute("SELECT COUNT(DISTINCT device_id) AS c FROM license_activations WHERE license_key=? AND app=?", (license_key_fmt, app_name))
     c = int(cur.fetchone()["c"] or 0)
 
@@ -779,7 +780,7 @@ def license_status():
         if not ok:
             conn.rollback()
             return jsonify({"error": reason, **meta}), 403
-        conn.rollback()  # status не должен менять БД (кроме last_seen); но last_seen полезен
+        conn.rollback()  # status РЅРµ РґРѕР»Р¶РµРЅ РјРµРЅСЏС‚СЊ Р‘Р” (РєСЂРѕРјРµ last_seen); РЅРѕ last_seen РїРѕР»РµР·РµРЅ
         return jsonify({"status": "ok", **meta}), 200
     finally:
         conn.close()
@@ -942,9 +943,9 @@ def register():
         if cur.fetchone():
             return jsonify({"error": "username_taken"}), 409
 
-        # Оплата отключена. Теперь регистрация может подтверждаться:
-        # 1) старым invite_code (если он есть), или
-        # 2) license_key (продуктовый ключ).
+        # РћРїР»Р°С‚Р° РѕС‚РєР»СЋС‡РµРЅР°. РўРµРїРµСЂСЊ СЂРµРіРёСЃС‚СЂР°С†РёСЏ РјРѕР¶РµС‚ РїРѕРґС‚РІРµСЂР¶РґР°С‚СЊСЃСЏ:
+        # 1) СЃС‚Р°СЂС‹Рј invite_code (РµСЃР»Рё РѕРЅ РµСЃС‚СЊ), РёР»Рё
+        # 2) license_key (РїСЂРѕРґСѓРєС‚РѕРІС‹Р№ РєР»СЋС‡).
         meta = {}
         if invite_code:
             ok, reason = validate_and_consume_invite_code(conn, invite_code, role)
@@ -1193,6 +1194,37 @@ def market_orders():
         conn.close()
 
 
+@app.get("/market/stats/orders")
+def market_stats_orders():
+    meta, err, code = require_auth()
+    if err:
+        return err, code
+
+    role = (meta.get("role") or "").strip().lower()
+    if role not in ("manager", "transport", "admin"):
+        return jsonify({"error": "forbidden"}), 403
+
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT "
+            "o.id, o.username, o.direction, o.cargo, o.tonnage, o.truck, o.date, "
+            "o.price, o.info, o.created_at, "
+            "COALESCE(u.company_name, '') AS company_name "
+            "FROM orders o "
+            "JOIN market_orders m ON m.order_id = o.id "
+            "LEFT JOIN users u ON u.username = o.username "
+            "WHERE m.status='open' "
+            "ORDER BY o.created_at DESC, o.id DESC "
+            "LIMIT 1000"
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        return jsonify({"items": rows, "total": len(rows)}), 200
+    finally:
+        conn.close()
+
+
 @app.post("/market/offer")
 def market_offer():
     meta, err, code = require_auth()
@@ -1261,6 +1293,59 @@ def market_offers(order_id: int):
         conn.close()
 
 
+@app.get("/market/my-offers")
+def market_my_offers():
+    meta, err, code = require_auth()
+    if err:
+        return err, code
+
+    if meta.get("role") != "transport":
+        return jsonify({"error": "forbidden"}), 403
+
+    username = meta["username"]
+    hours_raw = (request.args.get("hours") or "").strip()
+    cutoff_ts = None
+    if hours_raw:
+        try:
+            hours_i = int(hours_raw)
+        except Exception:
+            return jsonify({"error": "bad hours"}), 400
+        if hours_i <= 0 or hours_i > MARKET_MY_OFFERS_MAX_HOURS:
+            return jsonify({"error": "bad hours"}), 400
+        cutoff_ts = now_ts() - (hours_i * 3600)
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        sql = (
+            "SELECT "
+            "mo.order_id, mo.price AS offer_price, mo.comment AS offer_comment, "
+            "mo.contact AS offer_contact, mo.company AS offer_company, "
+            "mo.created_at AS offer_created_at, "
+            "o.direction, o.cargo, o.tonnage, o.truck, o.date, "
+            "o.price AS order_price, o.info, o.status AS order_status, "
+            "o.created_at AS order_created_at, o.closed_at AS order_closed_at, "
+            "COALESCE(m.status, '') AS market_status, "
+            "COALESCE(u.company_name, '') AS from_company, "
+            "o.username AS manager_username "
+            "FROM market_offers mo "
+            "JOIN orders o ON o.id = mo.order_id "
+            "LEFT JOIN market_orders m ON m.order_id = mo.order_id "
+            "LEFT JOIN users u ON u.username = o.username "
+            "WHERE mo.transport_username=? "
+            "ORDER BY mo.created_at DESC, mo.id DESC "
+        )
+        params = [username]
+        if cutoff_ts is not None:
+            sql = sql.replace("WHERE mo.transport_username=? ", "WHERE mo.transport_username=? AND mo.created_at>=? ")
+            params.append(cutoff_ts)
+        sql += "LIMIT 500"
+        cur.execute(sql, tuple(params))
+        rows = [dict(r) for r in cur.fetchall()]
+        return jsonify({"items": rows, "total": len(rows)}), 200
+    finally:
+        conn.close()
+
+
 @app.get("/health")
 def health():
     return jsonify({
@@ -1284,7 +1369,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-devices", type=int, default=1, help="Max devices for generated key")
     parser.add_argument("--max-users", type=int, default=1, help="Max users that can register under this key")
     parser.add_argument("--max-active-devices", type=int, default=0, help="Max ACTIVE devices (0 = ignore). Active = last_seen within ACTIVE_DEVICE_WINDOW_SECONDS")
-    parser.add_argument("--days", type=int, default=0, help="Days until expiration (0 = бессрочно)")
+    parser.add_argument("--days", type=int, default=0, help="Days until expiration (0 = Р±РµСЃСЃСЂРѕС‡РЅРѕ)")
     parser.add_argument("--length", type=int, default=20, help="Key length (12..32)")
     parser.add_argument("--company", default="", help="Bind key to company (optional)")
     parser.add_argument("--note", default="", help="Optional note")
@@ -1301,7 +1386,7 @@ if __name__ == "__main__":
         default="",
         help="Permanently delete a license key from DB (and its activations). Example: --delete-key ABCD-....",
     )
-    # alias (на всякий случай)
+    # alias (РЅР° РІСЃСЏРєРёР№ СЃР»СѓС‡Р°Р№)
     parser.add_argument(
         "--delete-key-forever",
         dest="delete_key",
@@ -1309,7 +1394,7 @@ if __name__ == "__main__":
         help="Alias for --delete-key",
     )
 
-    # удобный алиас для привязки компании к существующему ключу
+    # СѓРґРѕР±РЅС‹Р№ Р°Р»РёР°СЃ РґР»СЏ РїСЂРёРІСЏР·РєРё РєРѕРјРїР°РЅРёРё Рє СЃСѓС‰РµСЃС‚РІСѓСЋС‰РµРјСѓ РєР»СЋС‡Сѓ
     parser.add_argument(
         "--bind-company",
         nargs=2,
@@ -1689,3 +1774,4 @@ if __name__ == "__main__":
                     and not args.disable_key and not args.enable_key and not args.set_key_company and not args.list_activations and not args.delete_user):
         print(f"[SERVER] TELEGRAM_ENABLED env: {TELEGRAM_ENABLED}")
         app.run(host=HOST, port=PORT, debug=False)
+
